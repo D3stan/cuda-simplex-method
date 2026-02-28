@@ -24,10 +24,14 @@
 // ===========================================================================
 
 #define EPSILON 1e-10
+#define PIVOT_TOL 1e-10      // Minimum pivot element (Harris test handles preference for larger)
+#define HARRIS_TOL 1e-5      // Harris ratio test tolerance
+#define PERTURB_EPS 1e-4     // Symbolic perturbation magnitude
+#define REFACTOR_INTERVAL 50  // Re-derive objective row every N iterations
 #define BLOCK_SIZE 256
 #define TILE_SIZE 16
 
-// Global verbosity flag (0 = silent, 1 = normal)
+// Global verbosity flag (0 = silent, 1 = normal, 2 = diagnostic only)
 static int g_verbose = 1;
 
 // CUDA error checking macro
@@ -909,40 +913,55 @@ __global__ void kernelFindPivotRow(
 ) {
     __shared__ double sharedRatio[BLOCK_SIZE];
     __shared__ int sharedRow[BLOCK_SIZE];
+    __shared__ double sharedPivotElem[BLOCK_SIZE];  // Track pivot element for Harris test
     
     int tid = threadIdx.x;
     
     // Initialize with "infinity"
     sharedRatio[tid] = DBL_MAX;
     sharedRow[tid] = -1;
+    sharedPivotElem[tid] = 0.0;
     
     // Each thread processes one or more rows (skip row 0 = objective)
+    // Harris ratio test: among near-tied ratios, prefer largest pivot element
     for (int row = tid + 1; row < numRows; row += blockDim.x) {
         double aij = tableau[row * numCols + pivotCol];
         double bi = tableau[row * numCols + (numCols - 1)];  // RHS column
         
-        // Minimum ratio test: only consider positive coefficients
-        if (aij > EPSILON) {
+        // Minimum ratio test: require pivot element above PIVOT_TOL for stability
+        if (aij > PIVOT_TOL) {
             double ratio = bi / aij;
-            // Only consider non-negative ratios (RHS should be non-negative in standard form)
-            if (ratio >= -EPSILON && ratio < sharedRatio[tid]) {
-                sharedRatio[tid] = ratio;
-                sharedRow[tid] = row;
+            if (ratio >= -EPSILON) {
+                if (ratio < sharedRatio[tid] - HARRIS_TOL) {
+                    // Clearly better ratio
+                    sharedRatio[tid] = ratio;
+                    sharedRow[tid] = row;
+                    sharedPivotElem[tid] = aij;
+                } else if (ratio < sharedRatio[tid] + HARRIS_TOL && aij > sharedPivotElem[tid]) {
+                    // Similar ratio but larger pivot element — prefer for stability
+                    sharedRatio[tid] = ratio;
+                    sharedRow[tid] = row;
+                    sharedPivotElem[tid] = aij;
+                }
             }
         }
     }
     __syncthreads();
     
-    // Reduction to find minimum ratio
+    // Reduction to find best pivot row (Harris ratio test)
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
-            if (sharedRatio[tid + stride] < sharedRatio[tid] - EPSILON) {
+            if (sharedRatio[tid + stride] < sharedRatio[tid] - HARRIS_TOL) {
+                // Clearly smaller ratio wins
                 sharedRatio[tid] = sharedRatio[tid + stride];
                 sharedRow[tid] = sharedRow[tid + stride];
-            } else if (fabs(sharedRatio[tid + stride] - sharedRatio[tid]) < EPSILON) {
-                // Tie-breaking: prefer smaller row index (Bland's rule for anti-cycling)
-                if (sharedRow[tid + stride] < sharedRow[tid] && sharedRow[tid + stride] >= 0) {
+                sharedPivotElem[tid] = sharedPivotElem[tid + stride];
+            } else if (sharedRatio[tid + stride] < sharedRatio[tid] + HARRIS_TOL) {
+                // Ratios are close — prefer larger pivot element for numerical stability
+                if (sharedPivotElem[tid + stride] > sharedPivotElem[tid]) {
+                    sharedRatio[tid] = sharedRatio[tid + stride];
                     sharedRow[tid] = sharedRow[tid + stride];
+                    sharedPivotElem[tid] = sharedPivotElem[tid + stride];
                 }
             }
         }
@@ -1131,6 +1150,13 @@ Tableau* createTableau(LPProblem* lp) {
         tab->hostData[row * tab->cols + (tab->cols - 1)] = lp->rhs[i];
     }
     
+    // Symbolic perturbation: add tiny epsilon to RHS to break degeneracy
+    // This prevents cycling and reduces numerical errors from degenerate pivots
+    for (int i = 0; i < lp->numConstraints; i++) {
+        int row = i + 1;
+        tab->hostData[row * tab->cols + (tab->cols - 1)] += (i + 1) * PERTURB_EPS;
+    }
+    
     // Set objective row (will be overwritten for Phase 1)
     // For maximization, negate coefficients (we always minimize internally)
     double objSign = (lp->sense == MAXIMIZE) ? -1.0 : 1.0;
@@ -1315,7 +1341,15 @@ void setupPhase2(Tableau* tab, const double* originalObjective) {
     // Set artificial variable coefficients to large positive value (to prevent re-entry)
     int artificialStart = tab->numOriginalVars + tab->numSlack;
     for (int j = artificialStart; j < artificialStart + tab->numArtificial; j++) {
-        tab->hostData[j] = 1e10;  // Big-M
+        // Only block non-basic artificials
+        int isBasic = 0;
+        for (int i = 0; i < tab->rows - 1; i++) {
+            if (tab->hostBasicVars[i] == j) { isBasic = 1; break; }
+        }
+        if (!isBasic) {
+            tab->hostData[j] = 1e20;  // Block from entering
+        }
+        // Basic artificials should have reduced cost 0 (already handled by canonicalization)
     }
     
     // Copy back to device
@@ -1324,10 +1358,57 @@ void setupPhase2(Tableau* tab, const double* originalObjective) {
 }
 
 /**
+ * Re-derive the objective row from scratch using the phase cost vector.
+ *
+ * This combats numerical drift that accumulates over many pivot operations.
+ * For each column j:   z_j = phaseCost[j] - sum_i{ phaseCost[basic[i]] * tableau[i+1][j] }
+ *
+ * @param tab       Tableau (synced to host before call)
+ * @param phaseCosts   Cost vector for the current phase (size: tab->cols)
+ * @param blockArt  If true, set non-basic artificial columns to +inf after re-derivation
+ */
+void rederiveObjectiveRow(Tableau* tab, const double* phaseCosts, int blockArt) {
+    // Recompute objective row on the host
+    for (int j = 0; j < tab->cols; j++) {
+        double val = phaseCosts[j];  // original cost for column j
+        for (int i = 0; i < tab->rows - 1; i++) {
+            int bv = tab->hostBasicVars[i];
+            double cb = phaseCosts[bv];  // cost of basic variable
+            if (fabs(cb) > EPSILON) {
+                val -= cb * tab->hostData[(i + 1) * tab->cols + j];
+            }
+        }
+        tab->hostData[j] = val;
+    }
+    
+    // Block non-basic artificial columns from entering the basis
+    if (blockArt) {
+        int artStart = tab->numOriginalVars + tab->numSlack;
+        for (int j = artStart; j < artStart + tab->numArtificial; j++) {
+            int isBasic = 0;
+            for (int i = 0; i < tab->rows - 1; i++) {
+                if (tab->hostBasicVars[i] == j) { isBasic = 1; break; }
+            }
+            if (!isBasic) {
+                tab->hostData[j] = 1e20;
+            }
+        }
+    }
+    
+    // Copy updated objective row back to device
+    CUDA_CHECK(cudaMemcpy(tab->data, tab->hostData,
+                          tab->cols * sizeof(double), cudaMemcpyHostToDevice));
+}
+
+/**
  * Run one phase of the simplex algorithm
  * Returns: OPTIMAL, UNBOUNDED, or ERROR
+ *
+ * @param phaseCosts  Cost vector for the current phase (size: tab->cols).
+ *                    Used for periodic objective row re-derivation.
+ *                    Pass NULL to disable re-derivation (not recommended).
  */
-SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations) {
+SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* phaseCosts, int blockArt) {
     // Allocate device memory for kernel outputs
     double *d_minVal, *d_minRatio;
     int *d_pivotCol, *d_pivotRow;
@@ -1355,7 +1436,7 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations) {
     int cacheBlocks = (maxDim + BLOCK_SIZE - 1) / BLOCK_SIZE;
     
     // Print the initial tableau before any pivoting
-    if (g_verbose) printTableauStep(tab, 0, -1, -1);
+    if (g_verbose == 1) printTableauStep(tab, 0, -1, -1);
     
     while (iteration < maxIterations) {
         iteration++;
@@ -1374,8 +1455,11 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations) {
         
         // Check for optimality
         if (h_pivotCol < 0) {
-            if (g_verbose)
+            if (g_verbose == 1)
                 printf("Iteration %d: Optimal solution found (min reduced cost: %.6f)\n", 
+                       iteration, h_minVal);
+            if (g_verbose >= 2)
+                printf("[DIAG] Phase converged after %d iterations (min reduced cost: %.10e)\n",
                        iteration, h_minVal);
             status = OPTIMAL;
             break;
@@ -1396,14 +1480,124 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations) {
         
         // Check for unboundedness
         if (h_pivotRow < 0) {
-            if (g_verbose)
-                printf("Iteration %d: Problem is unbounded (no valid pivot row for column %d)\n",
-                       iteration, h_pivotCol);
-            status = UNBOUNDED;
-            break;
+            // Before declaring unbounded, try recovery:
+            // 1. Re-derive objective row, check for negative RHS, skip column if needed
+            int recovered = 0;
+            
+            if (phaseCosts != NULL) {
+                syncTableauToHost(tab);
+                
+                // Check if there are positive entries with negative RHS (numerical issue).
+                // Try host-side ratio test with slightly relaxed threshold.
+                int bestRow = -1;
+                double bestRatio = DBL_MAX;
+                double bestPivElem = 0.0;
+                double ratioFloor = -HARRIS_TOL;  // Allow very slightly negative ratios only
+                for (int r = 1; r < tab->rows; r++) {
+                    double aij = tab->hostData[r * tab->cols + h_pivotCol];
+                    double bi  = tab->hostData[r * tab->cols + (tab->cols - 1)];
+                    if (aij > PIVOT_TOL) {
+                        double ratio = bi / aij;
+                        if (ratio >= ratioFloor) {
+                            if (ratio < bestRatio - HARRIS_TOL ||
+                                (ratio < bestRatio + HARRIS_TOL && aij > bestPivElem)) {
+                                bestRatio = ratio;
+                                bestRow = r;
+                                bestPivElem = aij;
+                            }
+                        }
+                    }
+                }
+                
+                if (bestRow >= 0) {
+                    // Found a valid pivot row with relaxed test — use it
+                    h_pivotRow = bestRow;
+                    h_minRatio = bestRatio;
+                    recovered = 1;
+                    if (g_verbose >= 2 && (iteration % 200 == 0))
+                        printf("[DIAG] Recovered pivot at iter %d: row %d, ratio %.6e (neg RHS recovery)\n",
+                               iteration, h_pivotRow, h_minRatio);
+                } else {
+                    // No positive entries at all in pivot column — skip this column
+                    // Set its reduced cost to +inf to block it, try next column
+                    double bigval = 1e20;
+                    tab->hostData[h_pivotCol] = bigval;
+                    CUDA_CHECK(cudaMemcpy(&tab->data[h_pivotCol], &bigval,
+                                          sizeof(double), cudaMemcpyHostToDevice));
+                    
+                    // Re-derive objective to get correct costs for other columns
+                    rederiveObjectiveRow(tab, phaseCosts, blockArt);
+                    // But keep the blocked column at +inf
+                    tab->hostData[h_pivotCol] = bigval;
+                    CUDA_CHECK(cudaMemcpy(&tab->data[h_pivotCol], &bigval,
+                                          sizeof(double), cudaMemcpyHostToDevice));
+                    
+                    // Try to find next pivot column
+                    kernelFindPivotColumnSimple<<<1, BLOCK_SIZE>>>(
+                        tab->data, tab->cols, d_minVal, d_pivotCol
+                    );
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                    CUDA_CHECK(cudaMemcpy(&h_pivotCol, d_pivotCol, sizeof(int), cudaMemcpyDeviceToHost));
+                    
+                    if (h_pivotCol >= 0) {
+                        // Try ratio test with new column (on device)
+                        kernelFindPivotRow<<<1, BLOCK_SIZE>>>(
+                            tab->data, h_pivotCol, tab->rows, tab->cols,
+                            d_minRatio, d_pivotRow
+                        );
+                        CUDA_CHECK(cudaDeviceSynchronize());
+                        CUDA_CHECK(cudaMemcpy(&h_pivotRow, d_pivotRow, sizeof(int), cudaMemcpyDeviceToHost));
+                        CUDA_CHECK(cudaMemcpy(&h_minRatio, d_minRatio, sizeof(double), cudaMemcpyDeviceToHost));
+                        
+                        if (h_pivotRow >= 0) {
+                            recovered = 1;
+                            if (g_verbose >= 2)
+                                printf("[DIAG] Column skip at iter %d: new pivot col %d, row %d\n",
+                                       iteration, h_pivotCol, h_pivotRow);
+                        }
+                    }
+                    
+                    if (!recovered) {
+                        // Restore objective row properly before declaring failure
+                        syncTableauToHost(tab);
+                        rederiveObjectiveRow(tab, phaseCosts, blockArt);
+                    }
+                }
+            }
+            
+            if (!recovered) {
+                if (g_verbose == 1)
+                    printf("Iteration %d: Problem is unbounded (no valid pivot row for column %d)\n",
+                           iteration, h_pivotCol);
+                if (g_verbose >= 2) {
+                    printf("[DIAG] UNBOUNDED at iteration %d, pivot col %d, min reduced cost %.10e\n",
+                           iteration, h_pivotCol, h_minVal);
+                    syncTableauToHost(tab);
+                    printf("[DIAG] Pivot column %d values (row: value, rhs):\n", h_pivotCol);
+                    int printed = 0;
+                    for (int r = 1; r < tab->rows && printed < 20; r++) {
+                        double v = tab->hostData[r * tab->cols + h_pivotCol];
+                        double rhs = tab->hostData[r * tab->cols + (tab->cols - 1)];
+                        if (fabs(v) > EPSILON) {
+                            printf("  row %d: col=%.10e rhs=%.10e\n", r, v, rhs);
+                            printed++;
+                        }
+                    }
+                    if (printed == 0) printf("  (all zero or near-zero)\n");
+                    // Count negative RHS
+                    int negCount = 0;
+                    for (int r = 1; r < tab->rows; r++) {
+                        if (tab->hostData[r * tab->cols + (tab->cols - 1)] < -EPSILON) negCount++;
+                    }
+                    printf("[DIAG] Rows with negative RHS: %d / %d\n", negCount, tab->rows - 1);
+                    printf("[DIAG] Objective row RHS: %.10e\n", tab->hostData[tab->cols - 1]);
+                }
+                status = UNBOUNDED;
+                break;
+            }
         }
         
-        if (g_verbose)
+        if (g_verbose == 1)
             printf("Iteration %d: Pivot at row %d, col %d (ratio: %.6f)\n",
                    iteration, h_pivotRow, h_pivotCol, h_minRatio);
         
@@ -1429,8 +1623,16 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations) {
                               sizeof(int), cudaMemcpyHostToDevice));
         tab->hostBasicVars[constraintIdx] = h_pivotCol;
         
+        // Periodic objective row re-derivation to combat numerical drift
+        if (phaseCosts != NULL && (iteration % REFACTOR_INTERVAL) == 0) {
+            syncTableauToHost(tab);
+            rederiveObjectiveRow(tab, phaseCosts, blockArt);
+            if (g_verbose >= 2 && (iteration % (REFACTOR_INTERVAL * 10)) == 0)
+                printf("[DIAG] Re-derived objective row at iteration %d\n", iteration);
+        }
+        
         // Print tableau after this pivot
-        if (g_verbose) printTableauStep(tab, iteration, h_pivotRow, h_pivotCol);
+        if (g_verbose == 1) printTableauStep(tab, iteration, h_pivotRow, h_pivotCol);
     }
     
     if (iteration >= maxIterations) {
@@ -1455,7 +1657,7 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations) {
 SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
     if (g_verbose) printf("\n=== Starting Two-Phase Simplex Method ===\n");
     
-    int maxIterations = 10000;
+    int maxIterations = 50000;
     
     // Check if Phase 1 is needed
     if (tab->numArtificial > 0) {
@@ -1466,10 +1668,42 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
         
         setupPhase1(tab, originalObjective);
         
-        SimplexStatus phase1Status = runSimplexPhase(tab, maxIterations);
+        // Build Phase 1 cost vector for periodic re-derivation
+        // Phase 1 objective: minimize sum of artificial variables
+        double* phase1Costs = (double*)calloc(tab->cols, sizeof(double));
+        int artStart = tab->numOriginalVars + tab->numSlack;
+        for (int j = artStart; j < artStart + tab->numArtificial; j++) {
+            phase1Costs[j] = 1.0;
+        }
+        
+        // Diagnostic: check Phase 1 objective row after setup
+        if (g_verbose >= 2) {
+            syncTableauToHost(tab);
+            double initPhase1Obj = tab->hostData[tab->cols - 1];
+            printf("[DIAG] Phase 1 initial objective (RHS): %.10f\n", initPhase1Obj);
+            int artInBasis = 0;
+            for (int i = 0; i < tab->rows - 1; i++) {
+                if (tab->hostBasicVars[i] >= artStart) artInBasis++;
+            }
+            printf("[DIAG] Artificial vars in basis: %d / %d\n", artInBasis, tab->numArtificial);
+            // Check for negative RHS values
+            int negRHS = 0;
+            for (int i = 1; i < tab->rows; i++) {
+                double rhs = tab->hostData[i * tab->cols + (tab->cols - 1)];
+                if (rhs < -EPSILON) { negRHS++; if (negRHS <= 5) printf("[DIAG] Negative RHS in row %d: %.6f\n", i, rhs); }
+            }
+            printf("[DIAG] Total rows with negative RHS: %d\n", negRHS);
+        }
+        
+        SimplexStatus phase1Status = runSimplexPhase(tab, maxIterations, phase1Costs, 0);
+        free(phase1Costs);
         
         if (phase1Status == UNBOUNDED) {
             printf("Error: Phase 1 should not be unbounded!\n");
+            if (g_verbose >= 2) {
+                syncTableauToHost(tab);
+                printf("[DIAG] Phase 1 ended UNBOUNDED. Obj row RHS: %.10f\n", tab->hostData[tab->cols - 1]);
+            }
             free(originalObjective);
             return ERROR;
         }
@@ -1479,14 +1713,29 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
             return phase1Status;
         }
         
-        // Check if Phase 1 objective is zero
+        // Check if Phase 1 objective is zero (within perturbation tolerance)
         syncTableauToHost(tab);
         double phase1Obj = tab->hostData[tab->cols - 1];  // Objective row, RHS column
         
-        if (g_verbose) printf("Phase 1 objective value: %.10f\n", phase1Obj);
+        // Account for symbolic perturbation: tolerance scales with problem size
+        double phase1Tol = (double)(tab->rows) * (double)(tab->rows) * PERTURB_EPS + 1e-6;
         
-        if (fabs(phase1Obj) > EPSILON) {
+        if (g_verbose) printf("Phase 1 objective value: %.10f (tolerance: %.6e)\n", phase1Obj, phase1Tol);
+        
+        if (fabs(phase1Obj) > phase1Tol) {
             if (g_verbose) printf("Problem is INFEASIBLE (Phase 1 objective = %.6f)\n", phase1Obj);
+            if (g_verbose >= 2) {
+                // Show which artificial vars are still in basis with non-zero values
+                int artStart = tab->numOriginalVars + tab->numSlack;
+                for (int i = 0; i < tab->rows - 1; i++) {
+                    int bv = tab->hostBasicVars[i];
+                    double val = tab->hostData[(i+1) * tab->cols + (tab->cols - 1)];
+                    if (bv >= artStart && fabs(val) > EPSILON) {
+                        printf("[DIAG] Artificial var a%d in basis row %d with value %.10f\n",
+                               bv - artStart, i+1, val);
+                    }
+                }
+            }
             free(originalObjective);
             return INFEASIBLE;
         }
@@ -1504,14 +1753,37 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
         if (g_verbose) printf("\n--- Phase 2: Optimizing original objective ---\n");
         setupPhase2(tab, originalObjective);
         
+        // Build Phase 2 cost vector for periodic re-derivation
+        double* phase2Costs = (double*)calloc(tab->cols, sizeof(double));
+        memcpy(phase2Costs, originalObjective, tab->cols * sizeof(double));
+        // Artificial variables get Big-M cost to prevent re-entry
+        int artificialStart2 = tab->numOriginalVars + tab->numSlack;
+        for (int j = artificialStart2; j < artificialStart2 + tab->numArtificial; j++) {
+            phase2Costs[j] = 1e10;
+        }
+        
         free(originalObjective);
+        
+        // Phase 2
+        SimplexStatus status = runSimplexPhase(tab, maxIterations, phase2Costs, 1);
+        free(phase2Costs);
+        return status;
     } else {
         if (g_verbose) printf("\nNo artificial variables needed - direct optimization\n");
     }
     
-    // Phase 2 (or single phase if no artificials)
-    SimplexStatus status = runSimplexPhase(tab, maxIterations);
+    // Single phase (no artificials) — build cost vector from objective row
+    double* phaseCosts = (double*)calloc(tab->cols, sizeof(double));
+    syncTableauToHost(tab);
+    // The original objective coefficients are already in the objective row
+    // (before any pivoting, so use what's stored — but we need the un-reduced costs)
+    double objSign = (lp->sense == MAXIMIZE) ? -1.0 : 1.0;
+    for (int j = 0; j < lp->numVars; j++) {
+        phaseCosts[j] = objSign * lp->objCoeffs[j];
+    }
     
+    SimplexStatus status = runSimplexPhase(tab, maxIterations, phaseCosts, 0);
+    free(phaseCosts);
     return status;
 }
 
@@ -1638,6 +1910,8 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--silent") == 0) {
             g_verbose = 0;
+        } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--diag") == 0) {
+            g_verbose = 2;
         } else if (argv[i][0] != '-') {
             inputFile = argv[i];
         }
