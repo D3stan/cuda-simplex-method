@@ -1157,25 +1157,88 @@ void syncTableauToHost(Tableau* tab) {
                           (tab->rows - 1) * sizeof(int), cudaMemcpyDeviceToHost));
 }
 
+/**
+ * Get a human-readable label for a variable index.
+ * Original vars: x0, x1, ...; Slack/surplus: s0, s1, ...; Artificial: a0, a1, ...
+ */
+static void getVarLabel(Tableau* tab, int varIdx, char* buf, int bufSize) {
+    if (varIdx < tab->numOriginalVars) {
+        snprintf(buf, bufSize, "x%d", varIdx);
+    } else if (varIdx < tab->numOriginalVars + tab->numSlack) {
+        snprintf(buf, bufSize, "s%d", varIdx - tab->numOriginalVars);
+    } else {
+        snprintf(buf, bufSize, "a%d", varIdx - tab->numOriginalVars - tab->numSlack);
+    }
+}
+
 void printTableau(Tableau* tab) {
     syncTableauToHost(tab);
     
-    printf("\nTableau (%d x %d):\n", tab->rows, tab->cols);
-    for (int i = 0; i < tab->rows; i++) {
-        if (i == 0) printf("Obj: ");
-        else printf("R%02d: ", i);
-        
+    int rhsCol = tab->cols - 1;
+    char label[16];
+    
+    // --- Column headers ---
+    printf("\n%10s|", "Basis");
+    for (int j = 0; j < tab->cols; j++) {
+        if (j == rhsCol)
+            printf("%10s", "RHS");
+        else {
+            getVarLabel(tab, j, label, sizeof(label));
+            printf("%10s", label);
+        }
+    }
+    printf("\n");
+    
+    // --- Header separator ---
+    printf("----------+");
+    for (int j = 0; j < tab->cols; j++) printf("----------");
+    printf("\n");
+    
+    // --- Objective row (row 0) ---
+    printf("%10s|", "z");
+    for (int j = 0; j < tab->cols; j++) {
+        printf("%10.3f", tab->hostData[j]);
+    }
+    printf("\n");
+    
+    // --- Separator between objective and constraint rows ---
+    printf("----------+");
+    for (int j = 0; j < tab->cols; j++) printf("----------");
+    printf("\n");
+    
+    // --- Constraint rows ---
+    for (int i = 1; i < tab->rows; i++) {
+        getVarLabel(tab, tab->hostBasicVars[i - 1], label, sizeof(label));
+        printf("%10s|", label);
         for (int j = 0; j < tab->cols; j++) {
-            printf("%8.3f ", tab->hostData[i * tab->cols + j]);
+            printf("%10.3f", tab->hostData[i * tab->cols + j]);
         }
         printf("\n");
     }
-    
-    printf("Basic variables: ");
-    for (int i = 0; i < tab->rows - 1; i++) {
-        printf("%d ", tab->hostBasicVars[i]);
-    }
     printf("\n");
+}
+
+/**
+ * Print the tableau with iteration context.
+ * iteration == 0 means "initial tableau"; pivotRow/pivotCol < 0 means no pivot info.
+ */
+void printTableauStep(Tableau* tab, int iteration, int pivotRow, int pivotCol) {
+    if (iteration == 0) {
+        printf("\n>>> Initial Tableau\n");
+    } else {
+        char enterLabel[16], leaveLabel[16];
+        if (pivotCol >= 0) getVarLabel(tab, pivotCol, enterLabel, sizeof(enterLabel));
+        else strcpy(enterLabel, "?");
+        if (pivotRow > 0) {
+            syncTableauToHost(tab);
+            getVarLabel(tab, tab->hostBasicVars[pivotRow - 1], leaveLabel, sizeof(leaveLabel));
+        } else {
+            strcpy(leaveLabel, "?");
+        }
+        printf("\n>>> Iteration %d  |  Entering: %s (col %d)  Leaving: %s (row %d)\n",
+               iteration, enterLabel, pivotCol, leaveLabel, pivotRow);
+    }
+    printTableau(tab);
 }
 
 // ===========================================================================
@@ -1281,6 +1344,9 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations) {
     int maxDim = (tab->rows > tab->cols) ? tab->rows : tab->cols;
     int cacheBlocks = (maxDim + BLOCK_SIZE - 1) / BLOCK_SIZE;
     
+    // Print the initial tableau before any pivoting
+    printTableauStep(tab, 0, -1, -1);
+    
     while (iteration < maxIterations) {
         iteration++;
         
@@ -1349,6 +1415,9 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations) {
         CUDA_CHECK(cudaMemcpy(&tab->basicVars[constraintIdx], &h_pivotCol, 
                               sizeof(int), cudaMemcpyHostToDevice));
         tab->hostBasicVars[constraintIdx] = h_pivotCol;
+        
+        // Print tableau after this pivot
+        printTableauStep(tab, iteration, h_pivotRow, h_pivotCol);
     }
     
     if (iteration >= maxIterations) {
@@ -1592,10 +1661,6 @@ int main(int argc, char* argv[]) {
     
     // Create tableau
     Tableau* tab = createTableau(lp);
-    
-    // Print initial tableau
-    printf("\nInitial Tableau:\n");
-    printTableau(tab);
     
     // Solve
     SimplexStatus status = solveSimplex(tab, lp);
