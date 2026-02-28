@@ -1454,7 +1454,7 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations) {
 SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
     if (g_verbose) printf("\n=== Starting Two-Phase Simplex Method ===\n");
     
-    int maxIterations = 1000;
+    int maxIterations = 10000;
     
     // Check if Phase 1 is needed
     if (tab->numArtificial > 0) {
