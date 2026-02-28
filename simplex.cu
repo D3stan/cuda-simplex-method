@@ -18,6 +18,8 @@
 #include <math.h>
 #include <float.h>
 #include <cuda_runtime.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 // ===========================================================================
 // CONSTANTS AND CONFIGURATION
@@ -33,6 +35,17 @@
 
 // Global verbosity flag (0 = silent, 1 = normal, 2 = diagnostic only)
 static int g_verbose = 1;
+
+// Output format
+typedef enum { OUTPUT_TEXT, OUTPUT_JSON, OUTPUT_CSV } OutputFormat;
+static OutputFormat g_outputFormat = OUTPUT_TEXT;
+
+// Iteration log file (NULL = disabled)
+static FILE* g_iterLog = NULL;
+
+// Current phase and total iteration counter (for logging)
+static int g_phase = 0;
+static int g_totalIterations = 0;
 
 // CUDA error checking macro
 #define CUDA_CHECK(call) \
@@ -1623,6 +1636,15 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* pha
                               sizeof(int), cudaMemcpyHostToDevice));
         tab->hostBasicVars[constraintIdx] = h_pivotCol;
         
+        // Track iteration count and log if enabled
+        g_totalIterations++;
+        if (g_iterLog) {
+            double objRHS;
+            CUDA_CHECK(cudaMemcpy(&objRHS, &tab->data[tab->cols - 1], sizeof(double), cudaMemcpyDeviceToHost));
+            fprintf(g_iterLog, "%d,%d,%d,%d,%.10e,%.10e,%.10e\n",
+                    g_totalIterations, g_phase, h_pivotCol, h_pivotRow, h_minVal, h_minRatio, objRHS);
+        }
+        
         // Periodic objective row re-derivation to combat numerical drift
         if (phaseCosts != NULL && (iteration % REFACTOR_INTERVAL) == 0) {
             syncTableauToHost(tab);
@@ -1695,6 +1717,7 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
             printf("[DIAG] Total rows with negative RHS: %d\n", negRHS);
         }
         
+        g_phase = 1;
         SimplexStatus phase1Status = runSimplexPhase(tab, maxIterations, phase1Costs, 0);
         free(phase1Costs);
         
@@ -1751,20 +1774,48 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
         }
         
         if (g_verbose) printf("\n--- Phase 2: Optimizing original objective ---\n");
+        
+        // Remove symbolic perturbation from RHS before Phase 2
+        // After Phase 1 pivoting, the artificial variable columns contain B^{-1}.
+        // RHS currently = B^{-1} * (b + perturbation). We want B^{-1} * b.
+        // Correction: for each constraint row r, subtract sum_j(B^{-1}[r][j] * (j+1)*PERTURB_EPS)
+        // where B^{-1}[r][j] = tableau[(r+1) * cols + (artStart + j)]
+        {
+            syncTableauToHost(tab);
+            int artStart = tab->numOriginalVars + tab->numSlack;
+            int nCons = tab->rows - 1;
+            for (int r = 0; r < nCons; r++) {
+                double correction = 0.0;
+                for (int j = 0; j < nCons; j++) {
+                    double bij = tab->hostData[(r + 1) * tab->cols + (artStart + j)];
+                    correction += bij * (j + 1) * PERTURB_EPS;
+                }
+                tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)] -= correction;
+                // Clamp negative values to zero — these were degenerate basic variables
+                // whose value was only the perturbation (now removed)
+                if (tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)] < 0.0) {
+                    tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)] = 0.0;
+                }
+            }
+            // Copy corrected RHS back to device
+            CUDA_CHECK(cudaMemcpy(tab->data, tab->hostData,
+                                  tab->rows * tab->cols * sizeof(double), cudaMemcpyHostToDevice));
+            if (g_verbose >= 2) printf("[DIAG] Removed perturbation from RHS before Phase 2\n");
+        }
+        
         setupPhase2(tab, originalObjective);
         
         // Build Phase 2 cost vector for periodic re-derivation
+        // Use 0 for artificial variables — blocking is handled by rederiveObjectiveRow's blockArt flag
         double* phase2Costs = (double*)calloc(tab->cols, sizeof(double));
         memcpy(phase2Costs, originalObjective, tab->cols * sizeof(double));
-        // Artificial variables get Big-M cost to prevent re-entry
-        int artificialStart2 = tab->numOriginalVars + tab->numSlack;
-        for (int j = artificialStart2; j < artificialStart2 + tab->numArtificial; j++) {
-            phase2Costs[j] = 1e10;
-        }
+        // Artificials get cost 0 to avoid Big-M numerical amplification
+        // They are blocked from re-entering by rederiveObjectiveRow(blockArt=1)
         
         free(originalObjective);
         
         // Phase 2
+        g_phase = 2;
         SimplexStatus status = runSimplexPhase(tab, maxIterations, phase2Costs, 1);
         free(phase2Costs);
         return status;
@@ -1782,6 +1833,7 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
         phaseCosts[j] = objSign * lp->objCoeffs[j];
     }
     
+    g_phase = 0;
     SimplexStatus status = runSimplexPhase(tab, maxIterations, phaseCosts, 0);
     free(phaseCosts);
     return status;
@@ -1839,6 +1891,172 @@ void printSolution(Tableau* tab, LPProblem* lp, SimplexStatus status) {
         printf("  (includes constant term: %.6f)\n", lp->objConstant);
     
     free(solution);
+}
+
+// ===========================================================================
+// OUTPUT FORMATTERS (JSON / CSV)
+// ===========================================================================
+
+/**
+ * Helper: extract solution values and compute objective
+ */
+static double extractSolutionValues(Tableau* tab, LPProblem* lp, double** outSolution) {
+    syncTableauToHost(tab);
+    
+    double* solution = (double*)calloc(tab->numOriginalVars, sizeof(double));
+    
+    for (int i = 0; i < tab->rows - 1; i++) {
+        int basicVar = tab->hostBasicVars[i];
+        if (basicVar < tab->numOriginalVars) {
+            solution[basicVar] = tab->hostData[(i + 1) * tab->cols + (tab->cols - 1)];
+        }
+    }
+    
+    double objValue = lp->objConstant;
+    for (int i = 0; i < lp->numVars; i++) {
+        objValue += lp->objCoeffs[i] * solution[i];
+    }
+    
+    *outSolution = solution;
+    return objValue;
+}
+
+static const char* statusString(SimplexStatus status) {
+    switch (status) {
+        case OPTIMAL:    return "OPTIMAL";
+        case INFEASIBLE: return "INFEASIBLE";
+        case UNBOUNDED:  return "UNBOUNDED";
+        case ERROR:      return "ERROR";
+        default:         return "UNKNOWN";
+    }
+}
+
+/**
+ * Print solution in JSON format
+ */
+void printSolutionJSON(Tableau* tab, LPProblem* lp, SimplexStatus status, double elapsed) {
+    printf("{\n");
+    printf("  \"problem\": \"%s\",\n", lp->name);
+    printf("  \"status\": \"%s\",\n", statusString(status));
+    printf("  \"variables\": %d,\n", lp->numVars);
+    printf("  \"constraints\": %d,\n", lp->numConstraints);
+    printf("  \"sense\": \"%s\",\n", lp->sense == MAXIMIZE ? "maximize" : "minimize");
+    printf("  \"iterations\": %d,\n", g_totalIterations);
+    printf("  \"elapsed_seconds\": %.6f", elapsed);
+    
+    if (status == OPTIMAL) {
+        double* solution;
+        double objValue = extractSolutionValues(tab, lp, &solution);
+        
+        printf(",\n  \"objective_value\": %.10f,\n", objValue);
+        if (lp->objConstant != 0.0)
+            printf("  \"objective_constant\": %.10f,\n", lp->objConstant);
+        printf("  \"solution\": {");
+        int first = 1;
+        for (int i = 0; i < lp->numVars; i++) {
+            if (fabs(solution[i]) > EPSILON) {
+                if (!first) printf(",");
+                printf("\n    \"%s\": %.10f", lp->varNames[i], solution[i]);
+                first = 0;
+            }
+        }
+        printf("\n  }");
+        free(solution);
+    }
+    printf("\n}\n");
+}
+
+/**
+ * Print solution in CSV format (one header + one data row)
+ */
+void printSolutionCSV(Tableau* tab, LPProblem* lp, SimplexStatus status, double elapsed) {
+    printf("problem,status,variables,constraints,sense,iterations,elapsed_seconds,objective_value\n");
+    
+    double objValue = 0.0;
+    if (status == OPTIMAL) {
+        double* solution;
+        objValue = extractSolutionValues(tab, lp, &solution);
+        free(solution);
+    }
+    
+    printf("%s,%s,%d,%d,%s,%d,%.6f,%.10f\n",
+           lp->name, statusString(status),
+           lp->numVars, lp->numConstraints,
+           lp->sense == MAXIMIZE ? "maximize" : "minimize",
+           g_totalIterations, elapsed, objValue);
+}
+
+/**
+ * Dispatch solution output based on g_outputFormat
+ */
+void outputSolution(Tableau* tab, LPProblem* lp, SimplexStatus status, double elapsed) {
+    switch (g_outputFormat) {
+        case OUTPUT_JSON:
+            printSolutionJSON(tab, lp, status, elapsed);
+            break;
+        case OUTPUT_CSV:
+            printSolutionCSV(tab, lp, status, elapsed);
+            break;
+        case OUTPUT_TEXT:
+        default:
+            printSolution(tab, lp, status);
+            printf("\nElapsed time: %.6f seconds\n", elapsed);
+            printf("Total iterations: %d\n", g_totalIterations);
+            break;
+    }
+}
+
+// ===========================================================================
+// BATCH MODE
+// ===========================================================================
+
+typedef struct {
+    char filename[512];
+    int numVars;
+    int numConstraints;
+    const char* statusStr;
+    double objValue;
+    int iterations;
+    double elapsed;
+} BatchResult;
+
+void printBatchSummaryText(BatchResult* results, int count) {
+    printf("\n%-20s %6s %6s  %-12s %18s %8s %10s\n",
+           "Problem", "Vars", "Cons", "Status", "Obj Value", "Iters", "Time(s)");
+    printf("%-20s %6s %6s  %-12s %18s %8s %10s\n",
+           "--------------------", "------", "------", "------------",
+           "------------------", "--------", "----------");
+    
+    for (int i = 0; i < count; i++) {
+        printf("%-20s %6d %6d  %-12s %18.6e %8d %10.4f\n",
+               results[i].filename, results[i].numVars, results[i].numConstraints,
+               results[i].statusStr, results[i].objValue,
+               results[i].iterations, results[i].elapsed);
+    }
+}
+
+void printBatchSummaryJSON(BatchResult* results, int count) {
+    printf("[\n");
+    for (int i = 0; i < count; i++) {
+        printf("  {\"problem\": \"%s\", \"variables\": %d, \"constraints\": %d, "
+               "\"status\": \"%s\", \"objective_value\": %.10f, "
+               "\"iterations\": %d, \"elapsed_seconds\": %.6f}%s\n",
+               results[i].filename, results[i].numVars, results[i].numConstraints,
+               results[i].statusStr, results[i].objValue,
+               results[i].iterations, results[i].elapsed,
+               (i < count - 1) ? "," : "");
+    }
+    printf("]\n");
+}
+
+void printBatchSummaryCSV(BatchResult* results, int count) {
+    printf("problem,variables,constraints,status,objective_value,iterations,elapsed_seconds\n");
+    for (int i = 0; i < count; i++) {
+        printf("%s,%d,%d,%s,%.10f,%d,%.6f\n",
+               results[i].filename, results[i].numVars, results[i].numConstraints,
+               results[i].statusStr, results[i].objValue,
+               results[i].iterations, results[i].elapsed);
+    }
 }
 
 // ===========================================================================
@@ -1904,20 +2122,108 @@ LPProblem* createTestProblem() {
     return lp;
 }
 
+void printUsage(const char* progName) {
+    fprintf(stderr, "CUDA Two-Phase Simplex Solver\n\n");
+    fprintf(stderr, "Usage: %s [options] <problem.mps> [...]\n\n", progName);
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  -s, --silent       Suppress solver output\n");
+    fprintf(stderr, "  -d, --diag         Enable diagnostic output\n");
+    fprintf(stderr, "  --json             Output solution in JSON format\n");
+    fprintf(stderr, "  --csv              Output solution in CSV format\n");
+    fprintf(stderr, "  --batch            Batch mode: solve multiple files, print summary\n");
+    fprintf(stderr, "  --log <file>       Write per-iteration log to CSV file\n");
+    fprintf(stderr, "  -h, --help         Show this help message\n\n");
+    fprintf(stderr, "Examples:\n");
+    fprintf(stderr, "  %s problem.mps\n", progName);
+    fprintf(stderr, "  %s --json problem.mps\n", progName);
+    fprintf(stderr, "  %s --batch netlib/*.mps\n", progName);
+    fprintf(stderr, "  %s --batch netlib/\n", progName);
+    fprintf(stderr, "  %s --log iter.csv problem.mps\n", progName);
+}
+
 int main(int argc, char* argv[]) {
     // Parse flags
-    const char* inputFile = NULL;
+    int batchMode = 0;
+    const char* logFile = NULL;
+    int inputCount = 0;
+    const char** inputFiles = (const char**)malloc(argc * sizeof(const char*));
+    
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--silent") == 0) {
             g_verbose = 0;
         } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--diag") == 0) {
             g_verbose = 2;
+        } else if (strcmp(argv[i], "--json") == 0) {
+            g_outputFormat = OUTPUT_JSON;
+        } else if (strcmp(argv[i], "--csv") == 0) {
+            g_outputFormat = OUTPUT_CSV;
+        } else if (strcmp(argv[i], "--batch") == 0) {
+            batchMode = 1;
+        } else if (strcmp(argv[i], "--log") == 0) {
+            if (i + 1 < argc) {
+                logFile = argv[++i];
+            } else {
+                fprintf(stderr, "Error: --log requires a filename argument\n");
+                free(inputFiles);
+                return EXIT_FAILURE;
+            }
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            printUsage(argv[0]);
+            free(inputFiles);
+            return EXIT_SUCCESS;
         } else if (argv[i][0] != '-') {
-            inputFile = argv[i];
+            inputFiles[inputCount++] = argv[i];
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+            free(inputFiles);
+            return EXIT_FAILURE;
         }
     }
     
-    if (g_verbose) {
+    // In batch mode, auto-expand directory arguments into .mps files
+    if (batchMode) {
+        int expandedCount = 0;
+        const char** expandedFiles = (const char**)malloc(4096 * sizeof(const char*));
+        
+        for (int i = 0; i < inputCount; i++) {
+            struct stat st;
+            if (stat(inputFiles[i], &st) == 0 && S_ISDIR(st.st_mode)) {
+                DIR* dir = opendir(inputFiles[i]);
+                if (dir) {
+                    struct dirent* entry;
+                    while ((entry = readdir(dir)) != NULL) {
+                        int len = (int)strlen(entry->d_name);
+                        if (len > 4 && strcmp(entry->d_name + len - 4, ".mps") == 0) {
+                            char* fullpath = (char*)malloc(512);
+                            snprintf(fullpath, 512, "%s/%s", inputFiles[i], entry->d_name);
+                            expandedFiles[expandedCount++] = fullpath;
+                        }
+                    }
+                    closedir(dir);
+                }
+            } else {
+                expandedFiles[expandedCount++] = inputFiles[i];
+            }
+        }
+        
+        free(inputFiles);
+        inputFiles = expandedFiles;
+        inputCount = expandedCount;
+    }
+    
+    // Open iteration log if requested
+    if (logFile) {
+        g_iterLog = fopen(logFile, "w");
+        if (!g_iterLog) {
+            fprintf(stderr, "Error: Cannot open log file %s\n", logFile);
+            free((void*)inputFiles);
+            return EXIT_FAILURE;
+        }
+        fprintf(g_iterLog, "iter,phase,pivot_col,pivot_row,reduced_cost,ratio,obj_rhs\n");
+    }
+    
+    if (g_verbose && g_outputFormat == OUTPUT_TEXT) {
         printf("CUDA Two-Phase Simplex Solver\n");
         printf("=============================\n\n");
     }
@@ -1927,63 +2233,164 @@ int main(int argc, char* argv[]) {
     CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
     if (deviceCount == 0) {
         fprintf(stderr, "Error: No CUDA-capable device found!\n");
+        if (g_iterLog) fclose(g_iterLog);
+        free((void*)inputFiles);
         return EXIT_FAILURE;
     }
     
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-    if (g_verbose) {
+    if (g_verbose && g_outputFormat == OUTPUT_TEXT) {
         printf("Using CUDA device: %s\n", prop.name);
         printf("Compute capability: %d.%d\n\n", prop.major, prop.minor);
     }
     
-    LPProblem* lp = NULL;
+    int exitCode = EXIT_SUCCESS;
     
-    if (inputFile) {
-        if (g_verbose) printf("Loading problem from: %s\n\n", inputFile);
-        lp = parseMPS(inputFile);
-        if (!lp) {
-            return EXIT_FAILURE;
-        }
-    } else {
-        if (g_verbose) {
-            printf("No input file provided. Using test problem.\n\n");
-            printf("Usage: %s [-s] <problem.mps>\n\n", argv[0]);
-        }
-        lp = createTestProblem();
+    if (batchMode && inputCount > 0) {
+        // ===== BATCH MODE =====
+        int savedVerbose = g_verbose;
+        if (g_verbose < 2) g_verbose = 0;  // Silence per-problem output unless -d
         
-        if (g_verbose) {
-            printf("Test Problem:\n");
-            printf("  Maximize: 3*x1 + 2*x2\n");
-            printf("  Subject to:\n");
-            printf("    x1 + x2 <= 4\n");
-            printf("    2*x1 + x2 <= 6\n");
-            printf("  Expected: x1=2, x2=2, z=10\n");
+        BatchResult* results = (BatchResult*)malloc(inputCount * sizeof(BatchResult));
+        int resultCount = 0;
+        
+        for (int f = 0; f < inputCount; f++) {
+            // Extract base filename for display
+            const char* base = strrchr(inputFiles[f], '/');
+            const char* displayName = base ? base + 1 : inputFiles[f];
+            
+            LPProblem* lp = parseMPS(inputFiles[f]);
+            if (!lp) {
+                snprintf(results[resultCount].filename, sizeof(results[resultCount].filename),
+                         "%s", displayName);
+                results[resultCount].numVars = 0;
+                results[resultCount].numConstraints = 0;
+                results[resultCount].statusStr = "PARSE_ERROR";
+                results[resultCount].objValue = 0.0;
+                results[resultCount].iterations = 0;
+                results[resultCount].elapsed = 0.0;
+                resultCount++;
+                continue;
+            }
+            
+            snprintf(results[resultCount].filename, sizeof(results[resultCount].filename),
+                     "%s", displayName);
+            results[resultCount].numVars = lp->numVars;
+            results[resultCount].numConstraints = lp->numConstraints;
+            
+            preprocessBounds(lp);
+            Tableau* tab = createTableau(lp);
+            
+            g_totalIterations = 0;
+            
+            double tstart = hpc_gettime();
+            SimplexStatus status = solveSimplex(tab, lp);
+            double elapsed = hpc_gettime() - tstart;
+            
+            results[resultCount].statusStr = statusString(status);
+            results[resultCount].iterations = g_totalIterations;
+            results[resultCount].elapsed = elapsed;
+            
+            if (status == OPTIMAL) {
+                double* solution;
+                results[resultCount].objValue = extractSolutionValues(tab, lp, &solution);
+                free(solution);
+            } else {
+                results[resultCount].objValue = 0.0;
+            }
+            
+            freeTableau(tab);
+            freeLPProblem(lp);
+            resultCount++;
+            
+            if (savedVerbose && g_outputFormat == OUTPUT_TEXT) {
+                fprintf(stderr, "\rSolved %d/%d problems...", resultCount, inputCount);
+                fflush(stderr);
+            }
         }
+        
+        if (savedVerbose && g_outputFormat == OUTPUT_TEXT)
+            fprintf(stderr, "\r                              \r");
+        
+        g_verbose = savedVerbose;
+        
+        // Print batch summary
+        switch (g_outputFormat) {
+            case OUTPUT_JSON:
+                printBatchSummaryJSON(results, resultCount);
+                break;
+            case OUTPUT_CSV:
+                printBatchSummaryCSV(results, resultCount);
+                break;
+            case OUTPUT_TEXT:
+            default:
+                printBatchSummaryText(results, resultCount);
+                break;
+        }
+        
+        free(results);
+        
+    } else {
+        // ===== SINGLE FILE MODE =====
+        LPProblem* lp = NULL;
+        
+        if (inputCount > 0) {
+            if (g_verbose && g_outputFormat == OUTPUT_TEXT)
+                printf("Loading problem from: %s\n\n", inputFiles[0]);
+            lp = parseMPS(inputFiles[0]);
+            if (!lp) {
+                if (g_iterLog) fclose(g_iterLog);
+                free((void*)inputFiles);
+                return EXIT_FAILURE;
+            }
+        } else {
+            if (g_outputFormat == OUTPUT_TEXT && g_verbose) {
+                printf("No input file provided. Using test problem.\n\n");
+                printf("Usage: %s [options] <problem.mps>\n\n", argv[0]);
+            }
+            lp = createTestProblem();
+            
+            if (g_verbose && g_outputFormat == OUTPUT_TEXT) {
+                printf("Test Problem:\n");
+                printf("  Maximize: 3*x1 + 2*x2\n");
+                printf("  Subject to:\n");
+                printf("    x1 + x2 <= 4\n");
+                printf("    2*x1 + x2 <= 6\n");
+                printf("  Expected: x1=2, x2=2, z=10\n");
+            }
+        }
+        
+        // Preprocess variable bounds and range constraints
+        preprocessBounds(lp);
+        
+        // Create tableau
+        Tableau* tab = createTableau(lp);
+        
+        g_totalIterations = 0;
+        
+        // Time only the computation (solving), not I/O
+        double tstart = hpc_gettime();
+        
+        // Solve
+        SimplexStatus status = solveSimplex(tab, lp);
+        
+        double tfinish = hpc_gettime();
+        double elapsed = tfinish - tstart;
+        
+        // Output solution in the requested format
+        outputSolution(tab, lp, status, elapsed);
+        
+        // Cleanup
+        freeTableau(tab);
+        freeLPProblem(lp);
+        
+        exitCode = (status == OPTIMAL) ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     
-    // Preprocess variable bounds and range constraints
-    preprocessBounds(lp);
+    // Final cleanup
+    if (g_iterLog) fclose(g_iterLog);
+    free((void*)inputFiles);
     
-    // Create tableau
-    Tableau* tab = createTableau(lp);
-    
-    // Time only the computation (solving), not I/O
-    double tstart = hpc_gettime();
-    
-    // Solve
-    SimplexStatus status = solveSimplex(tab, lp);
-    
-    double tfinish = hpc_gettime();
-    double elapsed = tfinish - tstart;
-    
-    // Print solution
-    printSolution(tab, lp, status);
-    printf("\nElapsed time: %.6f seconds\n", elapsed);
-    
-    // Cleanup
-    freeTableau(tab);
-    freeLPProblem(lp);
-    
-    return (status == OPTIMAL) ? EXIT_SUCCESS : EXIT_FAILURE;
+    return exitCode;
 }
