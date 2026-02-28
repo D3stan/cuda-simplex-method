@@ -22,7 +22,7 @@ except ImportError:
 
 # ── Config ───────────────────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-TESTS_DIR = os.path.join(SCRIPT_DIR, "tests")
+DEFAULT_TESTS_DIR = os.path.join(SCRIPT_DIR, "tests")
 CUDA_BINARY = os.path.join(SCRIPT_DIR, "simplex.out")
 
 WARMUP_RUNS = 2       # discarded warm-up iterations
@@ -48,11 +48,16 @@ def solve_highs(mps_path: str):
     model_status = h.getModelStatus()
     obj = h.getInfoValue("objective_function_value")[1]
 
-    is_optimal = (
-        model_status == highspy.HighsModelStatus.kOptimal
-        or "kOptimal" in str(model_status)
-    )
-    status = "OPTIMAL" if is_optimal else str(model_status)
+    # Map HiGHS status to canonical strings matching CUDA solver output
+    status_str = str(model_status)
+    if "kOptimal" in status_str:
+        status = "OPTIMAL"
+    elif "kUnbounded" in status_str:
+        status = "UNBOUNDED"
+    elif "kInfeasible" in status_str:
+        status = "INFEASIBLE"
+    else:
+        status = status_str
     return obj, status, elapsed
 
 
@@ -85,16 +90,17 @@ def solve_cuda(binary: str, mps_path: str):
     elapsed = time.perf_counter() - t0
 
     output = result.stdout
-    if result.returncode != 0:
-        return None, "ERROR", elapsed
 
+    # Parse status from stdout (printed even on non-zero exit code)
     status = "UNKNOWN"
     if "Status: OPTIMAL" in output:
         status = "OPTIMAL"
-    elif "INFEASIBLE" in output:
+    elif "Status: INFEASIBLE" in output or "INFEASIBLE" in output:
         status = "INFEASIBLE"
-    elif "UNBOUNDED" in output:
+    elif "Status: UNBOUNDED" in output or "UNBOUNDED" in output:
         status = "UNBOUNDED"
+    elif result.returncode != 0:
+        status = "ERROR"
 
     m = re.search(r"Objective Value:\s*([-\d.eE+]+)", output)
     obj = float(m.group(1)) if m else None
@@ -142,9 +148,20 @@ def main():
         print(f"ERROR: CUDA binary not found at {CUDA_BINARY}")
         sys.exit(1)
 
-    mps_files = sorted(glob.glob(os.path.join(TESTS_DIR, "*.mps")))
+    # Accept directories or individual MPS files as CLI arguments
+    # Default: tests/
+    targets = sys.argv[1:] if len(sys.argv) > 1 else [DEFAULT_TESTS_DIR]
+    mps_files = []
+    for t in targets:
+        if os.path.isdir(t):
+            mps_files.extend(glob.glob(os.path.join(t, "*.mps")))
+        elif os.path.isfile(t) and t.endswith(".mps"):
+            mps_files.append(t)
+        else:
+            print(f"WARNING: skipping {t} (not a dir or .mps file)")
+    mps_files = sorted(mps_files)
     if not mps_files:
-        print(f"No MPS files found in {TESTS_DIR}")
+        print(f"No MPS files found in: {targets}")
         sys.exit(1)
 
     print("=" * 90)
