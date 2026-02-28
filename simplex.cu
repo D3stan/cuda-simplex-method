@@ -1775,15 +1775,14 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
         
         if (g_verbose) printf("\n--- Phase 2: Optimizing original objective ---\n");
         
-        // Remove symbolic perturbation from RHS before Phase 2
-        // After Phase 1 pivoting, the artificial variable columns contain B^{-1}.
-        // RHS currently = B^{-1} * (b + perturbation). We want B^{-1} * b.
-        // Correction: for each constraint row r, subtract sum_j(B^{-1}[r][j] * (j+1)*PERTURB_EPS)
-        // where B^{-1}[r][j] = tableau[(r+1) * cols + (artStart + j)]
+        // Remove symbolic perturbation and refine RHS before Phase 2
+        // Use iterative refinement for numerical accuracy
         {
             syncTableauToHost(tab);
             int artStart = tab->numOriginalVars + tab->numSlack;
             int nCons = tab->rows - 1;
+            
+            // Step 1: Remove perturbation via B^{-1} * perturbation subtraction
             for (int r = 0; r < nCons; r++) {
                 double correction = 0.0;
                 for (int j = 0; j < nCons; j++) {
@@ -1791,16 +1790,88 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
                     correction += bij * (j + 1) * PERTURB_EPS;
                 }
                 tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)] -= correction;
-                // Clamp negative values to zero — these were degenerate basic variables
-                // whose value was only the perturbation (now removed)
+            }
+            
+            // Step 2: Iterative refinement — compute residual r = b - B*x_B, correct x_B += B^{-1}*r
+            for (int refIter = 0; refIter < 3; refIter++) {
+                double* residual = (double*)calloc(nCons, sizeof(double));
+                
+                for (int i = 0; i < nCons; i++) {
+                    residual[i] = lp->rhs[i];  // b_original (unperturbed)
+                    for (int r = 0; r < nCons; r++) {
+                        int bv = tab->hostBasicVars[r];
+                        double xval = tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)];
+                        
+                        // Get original coefficient a[i][bv]
+                        double aij = 0.0;
+                        if (bv < lp->numVars) {
+                            aij = lp->constraintMatrix[i][bv];
+                        } else {
+                            // Slack/surplus/artificial: identity-like structure
+                            // Map variable index to constraint index
+                            int sIdx = bv - lp->numVars;
+                            int ctr = 0;
+                            for (int c = 0; c < nCons; c++) {
+                                if (lp->constraintTypes[c] == CONSTRAINT_LE) {
+                                    if (ctr == sIdx) { aij = (c == i) ? 1.0 : 0.0; goto found; }
+                                    ctr++;
+                                } else if (lp->constraintTypes[c] == CONSTRAINT_GE) {
+                                    // surplus first, then artificial
+                                    if (ctr == sIdx) { aij = (c == i) ? -1.0 : 0.0; goto found; }
+                                    ctr++;
+                                }
+                            }
+                            // Check artificial variables
+                            if (bv >= artStart) {
+                                int aIdx = bv - artStart;
+                                ctr = 0;
+                                for (int c = 0; c < nCons; c++) {
+                                    if (lp->constraintTypes[c] == CONSTRAINT_GE || 
+                                        lp->constraintTypes[c] == CONSTRAINT_EQ) {
+                                        if (ctr == aIdx) { aij = (c == i) ? 1.0 : 0.0; goto found; }
+                                        ctr++;
+                                    }
+                                }
+                            }
+                            found:;
+                        }
+                        
+                        residual[i] -= aij * xval;
+                    }
+                }
+                
+                // Apply correction: x_B += B^{-1} * residual
+                double maxCorrection = 0.0;
+                for (int r = 0; r < nCons; r++) {
+                    double corr = 0.0;
+                    for (int j = 0; j < nCons; j++) {
+                        double bij = tab->hostData[(r + 1) * tab->cols + (artStart + j)];
+                        corr += bij * residual[j];
+                    }
+                    tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)] += corr;
+                    if (fabs(corr) > maxCorrection) maxCorrection = fabs(corr);
+                }
+                
+                free(residual);
+                
+                if (g_verbose >= 2)
+                    printf("[DIAG] Iterative refinement %d: max correction = %.6e\n", 
+                           refIter + 1, maxCorrection);
+                
+                if (maxCorrection < 1e-12) break;
+            }
+            
+            // Clamp negative values to zero (degenerate basic variables)
+            for (int r = 0; r < nCons; r++) {
                 if (tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)] < 0.0) {
                     tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)] = 0.0;
                 }
             }
-            // Copy corrected RHS back to device
+            
+            // Copy back to device
             CUDA_CHECK(cudaMemcpy(tab->data, tab->hostData,
                                   tab->rows * tab->cols * sizeof(double), cudaMemcpyHostToDevice));
-            if (g_verbose >= 2) printf("[DIAG] Removed perturbation from RHS before Phase 2\n");
+            if (g_verbose >= 2) printf("[DIAG] Refined RHS before Phase 2\n");
         }
         
         setupPhase2(tab, originalObjective);
