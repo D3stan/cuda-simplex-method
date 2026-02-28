@@ -1017,7 +1017,27 @@ __global__ void kernelCachePivotData(
 Tableau* createTableau(LPProblem* lp) {
     Tableau* tab = (Tableau*)malloc(sizeof(Tableau));
     
-    // Count additional variables needed
+    // Pre-pass: flip constraints with negative RHS so that b >= 0
+    // This must happen BEFORE counting slack/surplus/artificial variables,
+    // because flipping LE->GE (or GE->LE) changes the variable types needed.
+    for (int i = 0; i < lp->numConstraints; i++) {
+        if (lp->rhs[i] < 0) {
+            // Multiply entire constraint by -1
+            for (int j = 0; j < lp->numVars; j++) {
+                lp->constraintMatrix[i][j] *= -1.0;
+            }
+            lp->rhs[i] *= -1.0;
+            // Flip constraint type
+            if (lp->constraintTypes[i] == CONSTRAINT_LE) {
+                lp->constraintTypes[i] = CONSTRAINT_GE;
+            } else if (lp->constraintTypes[i] == CONSTRAINT_GE) {
+                lp->constraintTypes[i] = CONSTRAINT_LE;
+            }
+            // EQ stays EQ (just negated coefficients and RHS)
+        }
+    }
+    
+    // Count additional variables needed (after RHS flipping)
     int numSlack = 0;
     int numSurplus = 0;
     int numArtificial = 0;
@@ -1065,25 +1085,9 @@ Tableau* createTableau(LPProblem* lp) {
     for (int i = 0; i < lp->numConstraints; i++) {
         int row = i + 1;  // Skip objective row
         
-        // Original variable coefficients
+        // Original variable coefficients (already flipped if RHS was negative)
         for (int j = 0; j < lp->numVars; j++) {
             tab->hostData[row * tab->cols + j] = lp->constraintMatrix[i][j];
-        }
-        
-        // Handle RHS sign (we need b >= 0)
-        double rhsSign = 1.0;
-        if (lp->rhs[i] < 0) {
-            rhsSign = -1.0;
-            // Multiply entire row by -1
-            for (int j = 0; j < lp->numVars; j++) {
-                tab->hostData[row * tab->cols + j] *= -1.0;
-            }
-            // Flip constraint type
-            if (lp->constraintTypes[i] == CONSTRAINT_LE) {
-                lp->constraintTypes[i] = CONSTRAINT_GE;
-            } else if (lp->constraintTypes[i] == CONSTRAINT_GE) {
-                lp->constraintTypes[i] = CONSTRAINT_LE;
-            }
         }
         
         // Add slack/surplus/artificial variables
@@ -1113,8 +1117,8 @@ Tableau* createTableau(LPProblem* lp) {
                 break;
         }
         
-        // RHS (last column)
-        tab->hostData[row * tab->cols + (tab->cols - 1)] = fabs(lp->rhs[i]);
+        // RHS (last column) - already non-negative after pre-pass
+        tab->hostData[row * tab->cols + (tab->cols - 1)] = lp->rhs[i];
     }
     
     // Set objective row (will be overwritten for Phase 1)
