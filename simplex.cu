@@ -26,6 +26,9 @@
 #define BLOCK_SIZE 256
 #define TILE_SIZE 16
 
+// Global verbosity flag (0 = silent, 1 = normal)
+static int g_verbose = 1;
+
 // CUDA error checking macro
 #define CUDA_CHECK(call) \
     do { \
@@ -561,12 +564,14 @@ LPProblem* parseMPS(const char* filename) {
     free(rowNames);   // Individual names transferred; only free the pointer array
     if (objRowName) free(objRowName);
     
-    printf("Parsed LP: %s\n", lp->name);
-    printf("  Variables: %d\n", lp->numVars);
-    printf("  Constraints: %d\n", lp->numConstraints);
-    printf("  Sense: %s\n", lp->sense == MAXIMIZE ? "MAXIMIZE" : "MINIMIZE");
-    if (lp->objConstant != 0.0)
-        printf("  Objective constant: %.6f\n", lp->objConstant);
+    if (g_verbose) {
+        printf("Parsed LP: %s\n", lp->name);
+        printf("  Variables: %d\n", lp->numVars);
+        printf("  Constraints: %d\n", lp->numConstraints);
+        printf("  Sense: %s\n", lp->sense == MAXIMIZE ? "MAXIMIZE" : "MINIMIZE");
+        if (lp->objConstant != 0.0)
+            printf("  Objective constant: %.6f\n", lp->objConstant);
+    }
     
     return lp;
 }
@@ -737,9 +742,11 @@ void preprocessBounds(LPProblem* lp) {
         lp->numConstraints = newNumConstraints;
     }
     
-    printf("After bound preprocessing:\n");
-    printf("  Variables: %d (was %d)\n", lp->numVars, origVars);
-    printf("  Constraints: %d (was %d)\n", lp->numConstraints, origConstraints);
+    if (g_verbose) {
+        printf("After bound preprocessing:\n");
+        printf("  Variables: %d (was %d)\n", lp->numVars, origVars);
+        printf("  Constraints: %d (was %d)\n", lp->numConstraints, origConstraints);
+    }
 }
 
 void freeLPProblem(LPProblem* lp) {
@@ -1067,11 +1074,13 @@ Tableau* createTableau(LPProblem* lp) {
     tab->rows = lp->numConstraints + 1;
     tab->cols = lp->numVars + numSlack + numSurplus + numArtificial + 1;
     
-    printf("Tableau dimensions: %d x %d\n", tab->rows, tab->cols);
-    printf("  Original variables: %d\n", lp->numVars);
-    printf("  Slack variables: %d\n", numSlack);
-    printf("  Surplus variables: %d\n", numSurplus);
-    printf("  Artificial variables: %d\n", numArtificial);
+    if (g_verbose) {
+        printf("Tableau dimensions: %d x %d\n", tab->rows, tab->cols);
+        printf("  Original variables: %d\n", lp->numVars);
+        printf("  Slack variables: %d\n", numSlack);
+        printf("  Surplus variables: %d\n", numSurplus);
+        printf("  Artificial variables: %d\n", numArtificial);
+    }
     
     // Allocate host memory
     size_t tableauSize = tab->rows * tab->cols * sizeof(double);
@@ -1345,7 +1354,7 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations) {
     int cacheBlocks = (maxDim + BLOCK_SIZE - 1) / BLOCK_SIZE;
     
     // Print the initial tableau before any pivoting
-    printTableauStep(tab, 0, -1, -1);
+    if (g_verbose) printTableauStep(tab, 0, -1, -1);
     
     while (iteration < maxIterations) {
         iteration++;
@@ -1364,8 +1373,9 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations) {
         
         // Check for optimality
         if (h_pivotCol < 0) {
-            printf("Iteration %d: Optimal solution found (min reduced cost: %.6f)\n", 
-                   iteration, h_minVal);
+            if (g_verbose)
+                printf("Iteration %d: Optimal solution found (min reduced cost: %.6f)\n", 
+                       iteration, h_minVal);
             status = OPTIMAL;
             break;
         }
@@ -1385,14 +1395,16 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations) {
         
         // Check for unboundedness
         if (h_pivotRow < 0) {
-            printf("Iteration %d: Problem is unbounded (no valid pivot row for column %d)\n",
-                   iteration, h_pivotCol);
+            if (g_verbose)
+                printf("Iteration %d: Problem is unbounded (no valid pivot row for column %d)\n",
+                       iteration, h_pivotCol);
             status = UNBOUNDED;
             break;
         }
         
-        printf("Iteration %d: Pivot at row %d, col %d (ratio: %.6f)\n",
-               iteration, h_pivotRow, h_pivotCol, h_minRatio);
+        if (g_verbose)
+            printf("Iteration %d: Pivot at row %d, col %d (ratio: %.6f)\n",
+                   iteration, h_pivotRow, h_pivotCol, h_minRatio);
         
         // Step 3: Cache pivot row and column
         kernelCachePivotData<<<cacheBlocks, BLOCK_SIZE>>>(
@@ -1417,7 +1429,7 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations) {
         tab->hostBasicVars[constraintIdx] = h_pivotCol;
         
         // Print tableau after this pivot
-        printTableauStep(tab, iteration, h_pivotRow, h_pivotCol);
+        if (g_verbose) printTableauStep(tab, iteration, h_pivotRow, h_pivotCol);
     }
     
     if (iteration >= maxIterations) {
@@ -1440,13 +1452,13 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations) {
  * Main two-phase simplex solver
  */
 SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
-    printf("\n=== Starting Two-Phase Simplex Method ===\n");
+    if (g_verbose) printf("\n=== Starting Two-Phase Simplex Method ===\n");
     
     int maxIterations = 1000;
     
     // Check if Phase 1 is needed
     if (tab->numArtificial > 0) {
-        printf("\n--- Phase 1: Finding basic feasible solution ---\n");
+        if (g_verbose) printf("\n--- Phase 1: Finding basic feasible solution ---\n");
         
         // Save original objective
         double* originalObjective = (double*)malloc(tab->cols * sizeof(double));
@@ -1470,10 +1482,10 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
         syncTableauToHost(tab);
         double phase1Obj = tab->hostData[tab->cols - 1];  // Objective row, RHS column
         
-        printf("Phase 1 objective value: %.10f\n", phase1Obj);
+        if (g_verbose) printf("Phase 1 objective value: %.10f\n", phase1Obj);
         
         if (fabs(phase1Obj) > EPSILON) {
-            printf("Problem is INFEASIBLE (Phase 1 objective = %.6f)\n", phase1Obj);
+            if (g_verbose) printf("Problem is INFEASIBLE (Phase 1 objective = %.6f)\n", phase1Obj);
             free(originalObjective);
             return INFEASIBLE;
         }
@@ -1482,17 +1494,18 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
         int artificialStart = tab->numOriginalVars + tab->numSlack;
         for (int i = 0; i < tab->rows - 1; i++) {
             if (tab->hostBasicVars[i] >= artificialStart) {
-                printf("Warning: Artificial variable %d still in basis (degenerate)\n",
-                       tab->hostBasicVars[i]);
+                if (g_verbose)
+                    printf("Warning: Artificial variable %d still in basis (degenerate)\n",
+                           tab->hostBasicVars[i]);
             }
         }
         
-        printf("\n--- Phase 2: Optimizing original objective ---\n");
+        if (g_verbose) printf("\n--- Phase 2: Optimizing original objective ---\n");
         setupPhase2(tab, originalObjective);
         
         free(originalObjective);
     } else {
-        printf("\nNo artificial variables needed - direct optimization\n");
+        if (g_verbose) printf("\nNo artificial variables needed - direct optimization\n");
     }
     
     // Phase 2 (or single phase if no artificials)
@@ -1619,8 +1632,20 @@ LPProblem* createTestProblem() {
 }
 
 int main(int argc, char* argv[]) {
-    printf("CUDA Two-Phase Simplex Solver\n");
-    printf("=============================\n\n");
+    // Parse flags
+    const char* inputFile = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--silent") == 0) {
+            g_verbose = 0;
+        } else if (argv[i][0] != '-') {
+            inputFile = argv[i];
+        }
+    }
+    
+    if (g_verbose) {
+        printf("CUDA Two-Phase Simplex Solver\n");
+        printf("=============================\n\n");
+    }
     
     // Check CUDA device
     int deviceCount;
@@ -1632,28 +1657,34 @@ int main(int argc, char* argv[]) {
     
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-    printf("Using CUDA device: %s\n", prop.name);
-    printf("Compute capability: %d.%d\n\n", prop.major, prop.minor);
+    if (g_verbose) {
+        printf("Using CUDA device: %s\n", prop.name);
+        printf("Compute capability: %d.%d\n\n", prop.major, prop.minor);
+    }
     
     LPProblem* lp = NULL;
     
-    if (argc > 1) {
-        printf("Loading problem from: %s\n\n", argv[1]);
-        lp = parseMPS(argv[1]);
+    if (inputFile) {
+        if (g_verbose) printf("Loading problem from: %s\n\n", inputFile);
+        lp = parseMPS(inputFile);
         if (!lp) {
             return EXIT_FAILURE;
         }
     } else {
-        printf("No input file provided. Using test problem.\n\n");
-        printf("Usage: %s <problem.mps>\n\n", argv[0]);
+        if (g_verbose) {
+            printf("No input file provided. Using test problem.\n\n");
+            printf("Usage: %s [-s] <problem.mps>\n\n", argv[0]);
+        }
         lp = createTestProblem();
         
-        printf("Test Problem:\n");
-        printf("  Maximize: 3*x1 + 2*x2\n");
-        printf("  Subject to:\n");
-        printf("    x1 + x2 <= 4\n");
-        printf("    2*x1 + x2 <= 6\n");
-        printf("  Expected: x1=2, x2=2, z=10\n");
+        if (g_verbose) {
+            printf("Test Problem:\n");
+            printf("  Maximize: 3*x1 + 2*x2\n");
+            printf("  Subject to:\n");
+            printf("    x1 + x2 <= 4\n");
+            printf("    2*x1 + x2 <= 6\n");
+            printf("  Expected: x1=2, x2=2, z=10\n");
+        }
     }
     
     // Preprocess variable bounds and range constraints

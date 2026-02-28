@@ -82,10 +82,10 @@ def solve_cuda(binary: str, mps_path: str):
     """Run CUDA simplex; return (objective, status_str, elapsed_sec)."""
     t0 = time.perf_counter()
     result = subprocess.run(
-        [binary, mps_path],
+        [binary, "-s", mps_path],
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=600,
     )
     elapsed = time.perf_counter() - t0
 
