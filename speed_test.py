@@ -79,7 +79,13 @@ def bench_highs(mps_path: str, warmup: int, runs: int):
 # CUDA Simplex solver
 # ═══════════════════════════════════════════════════════════════════════════════
 def solve_cuda(binary: str, mps_path: str):
-    """Run CUDA simplex; return (objective, status_str, elapsed_sec)."""
+    """Run CUDA simplex; return (objective, status_str, elapsed_sec).
+
+    Elapsed time is read from the program's own internal timer
+    (hpc_gettime), which measures only the computation and excludes
+    file I/O and output.  Falls back to external wall-clock timing
+    if the internal timer line is not found.
+    """
     t0 = time.perf_counter()
     result = subprocess.run(
         [binary, "-s", mps_path],
@@ -87,7 +93,7 @@ def solve_cuda(binary: str, mps_path: str):
         text=True,
         timeout=600,
     )
-    elapsed = time.perf_counter() - t0
+    external_elapsed = time.perf_counter() - t0
 
     output = result.stdout
 
@@ -104,6 +110,11 @@ def solve_cuda(binary: str, mps_path: str):
 
     m = re.search(r"Objective Value:\s*([-\d.eE+]+)", output)
     obj = float(m.group(1)) if m else None
+
+    # Prefer internal elapsed time reported by hpc_gettime() inside the solver
+    m_time = re.search(r"Elapsed time:\s*([\d.eE+-]+)\s*seconds", output)
+    elapsed = float(m_time.group(1)) if m_time else external_elapsed
+
     return obj, status, elapsed
 
 

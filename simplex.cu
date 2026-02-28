@@ -11,6 +11,7 @@
  * Usage: simplex <problem.mps>
  */
 
+#include "hpc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1693,11 +1694,18 @@ int main(int argc, char* argv[]) {
     // Create tableau
     Tableau* tab = createTableau(lp);
     
+    // Time only the computation (solving), not I/O
+    double tstart = hpc_gettime();
+    
     // Solve
     SimplexStatus status = solveSimplex(tab, lp);
     
+    double tfinish = hpc_gettime();
+    double elapsed = tfinish - tstart;
+    
     // Print solution
     printSolution(tab, lp, status);
+    printf("\nElapsed time: %.6f seconds\n", elapsed);
     
     // Cleanup
     freeTableau(tab);
