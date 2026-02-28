@@ -47,6 +47,16 @@ static FILE* g_iterLog = NULL;
 static int g_phase = 0;
 static int g_totalIterations = 0;
 
+// Debug flag: print initial, intermediate, and final tableaux
+static int g_debug = 0;
+
+// Max iterations (overridable via -m)
+static int g_maxIter = 50000;
+
+// Timeout in seconds (0 = no timeout)
+static double g_timeout = 0.0;
+static double g_solveStartTime = 0.0;
+
 // CUDA error checking macro
 #define CUDA_CHECK(call) \
     do { \
@@ -80,6 +90,7 @@ typedef enum {
     OPTIMAL,
     INFEASIBLE,
     UNBOUNDED,
+    TIMEOUT,
     ERROR
 } SimplexStatus;
 
@@ -1449,10 +1460,22 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* pha
     int cacheBlocks = (maxDim + BLOCK_SIZE - 1) / BLOCK_SIZE;
     
     // Print the initial tableau before any pivoting
-    if (g_verbose == 1) printTableauStep(tab, 0, -1, -1);
+    if (g_debug) printTableauStep(tab, 0, -1, -1);
     
     while (iteration < maxIterations) {
         iteration++;
+        
+        // Check timeout
+        if (g_timeout > 0.0) {
+            double now = hpc_gettime();
+            if (now - g_solveStartTime >= g_timeout) {
+                if (g_verbose)
+                    printf("Timeout after %.2f seconds at iteration %d\n",
+                           now - g_solveStartTime, iteration);
+                status = TIMEOUT;
+                break;
+            }
+        }
         
         // Step 1: Find pivot column (entering variable)
         h_pivotCol = -1;
@@ -1654,7 +1677,14 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* pha
         }
         
         // Print tableau after this pivot
-        if (g_verbose == 1) printTableauStep(tab, iteration, h_pivotRow, h_pivotCol);
+        if (g_debug) printTableauStep(tab, iteration, h_pivotRow, h_pivotCol);
+    }
+    
+    // Print final tableau in debug mode
+    if (g_debug && iteration > 0) {
+        printf("\n>>> Final Tableau (after %d iterations, status: %s)\n",
+               iteration, (status == OPTIMAL) ? "OPTIMAL" : "in-progress");
+        printTableau(tab);
     }
     
     if (iteration >= maxIterations) {
@@ -1679,7 +1709,8 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* pha
 SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
     if (g_verbose) printf("\n=== Starting Two-Phase Simplex Method ===\n");
     
-    int maxIterations = 50000;
+    int maxIterations = g_maxIter;
+    g_solveStartTime = hpc_gettime();
     
     // Check if Phase 1 is needed
     if (tab->numArtificial > 0) {
@@ -1775,8 +1806,7 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
         
         if (g_verbose) printf("\n--- Phase 2: Optimizing original objective ---\n");
         
-        // Remove symbolic perturbation and refine RHS before Phase 2
-        // Use iterative refinement for numerical accuracy
+        // Remove symbolic perturbation and optionally re-derive entire tableau before Phase 2
         {
             syncTableauToHost(tab);
             int artStart = tab->numOriginalVars + tab->numSlack;
@@ -1792,76 +1822,89 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
                 tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)] -= correction;
             }
             
-            // Step 2: Iterative refinement — compute residual r = b - B*x_B, correct x_B += B^{-1}*r
-            for (int refIter = 0; refIter < 3; refIter++) {
+            // Step 2: Check B^{-1} accuracy via one round of iterative refinement
+            double maxCorrection = 0.0;
+            {
                 double* residual = (double*)calloc(nCons, sizeof(double));
-                
                 for (int i = 0; i < nCons; i++) {
-                    residual[i] = lp->rhs[i];  // b_original (unperturbed)
+                    residual[i] = lp->rhs[i];
                     for (int r = 0; r < nCons; r++) {
                         int bv = tab->hostBasicVars[r];
                         double xval = tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)];
-                        
-                        // Get original coefficient a[i][bv]
                         double aij = 0.0;
                         if (bv < lp->numVars) {
                             aij = lp->constraintMatrix[i][bv];
+                        } else if (bv >= artStart) {
+                            int aIdx = bv - artStart;
+                            int ctr = 0;
+                            for (int c = 0; c < nCons; c++) {
+                                if (lp->constraintTypes[c] == CONSTRAINT_GE || 
+                                    lp->constraintTypes[c] == CONSTRAINT_EQ) {
+                                    if (ctr == aIdx) { aij = (c == i) ? 1.0 : 0.0; break; }
+                                    ctr++;
+                                }
+                            }
                         } else {
-                            // Slack/surplus/artificial: identity-like structure
-                            // Map variable index to constraint index
                             int sIdx = bv - lp->numVars;
                             int ctr = 0;
                             for (int c = 0; c < nCons; c++) {
                                 if (lp->constraintTypes[c] == CONSTRAINT_LE) {
-                                    if (ctr == sIdx) { aij = (c == i) ? 1.0 : 0.0; goto found; }
+                                    if (ctr == sIdx) { aij = (c == i) ? 1.0 : 0.0; break; }
                                     ctr++;
                                 } else if (lp->constraintTypes[c] == CONSTRAINT_GE) {
-                                    // surplus first, then artificial
-                                    if (ctr == sIdx) { aij = (c == i) ? -1.0 : 0.0; goto found; }
+                                    if (ctr == sIdx) { aij = (c == i) ? -1.0 : 0.0; break; }
                                     ctr++;
                                 }
                             }
-                            // Check artificial variables
-                            if (bv >= artStart) {
-                                int aIdx = bv - artStart;
-                                ctr = 0;
-                                for (int c = 0; c < nCons; c++) {
-                                    if (lp->constraintTypes[c] == CONSTRAINT_GE || 
-                                        lp->constraintTypes[c] == CONSTRAINT_EQ) {
-                                        if (ctr == aIdx) { aij = (c == i) ? 1.0 : 0.0; goto found; }
-                                        ctr++;
-                                    }
-                                }
-                            }
-                            found:;
                         }
-                        
                         residual[i] -= aij * xval;
                     }
                 }
                 
-                // Apply correction: x_B += B^{-1} * residual
-                double maxCorrection = 0.0;
+                // Apply correction if B^{-1} is reasonable
                 for (int r = 0; r < nCons; r++) {
                     double corr = 0.0;
                     for (int j = 0; j < nCons; j++) {
                         double bij = tab->hostData[(r + 1) * tab->cols + (artStart + j)];
                         corr += bij * residual[j];
                     }
-                    tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)] += corr;
                     if (fabs(corr) > maxCorrection) maxCorrection = fabs(corr);
+                    if (maxCorrection < 1.0) {  // Only apply if corrections are small
+                        tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)] += corr;
+                    }
                 }
-                
                 free(residual);
                 
                 if (g_verbose >= 2)
-                    printf("[DIAG] Iterative refinement %d: max correction = %.6e\n", 
-                           refIter + 1, maxCorrection);
-                
-                if (maxCorrection < 1e-12) break;
+                    printf("[DIAG] RHS refinement: max correction = %.6e (%s)\n", 
+                           maxCorrection, maxCorrection < 1.0 ? "applied" : "skipped-divergent");
             }
             
-            // Clamp negative values to zero (degenerate basic variables)
+            // Step 3: If B^{-1} is accurate, re-derive all original-variable columns
+            // This gives Phase 2 a clean starting tableau
+            if (maxCorrection < 1.0) {
+                for (int j = 0; j < lp->numVars; j++) {
+                    // Skip basic variable columns (they should be unit vectors)
+                    int isBasic = 0;
+                    for (int r = 0; r < nCons; r++) {
+                        if (tab->hostBasicVars[r] == j) { isBasic = 1; break; }
+                    }
+                    if (isBasic) continue;
+                    
+                    // Recompute column j: new[r] = sum_k B^{-1}[r][k] * A_orig[k][j]
+                    for (int r = 0; r < nCons; r++) {
+                        double val = 0.0;
+                        for (int k = 0; k < nCons; k++) {
+                            double bij = tab->hostData[(r + 1) * tab->cols + (artStart + k)];
+                            val += bij * lp->constraintMatrix[k][j];
+                        }
+                        tab->hostData[(r + 1) * tab->cols + j] = val;
+                    }
+                }
+                if (g_verbose >= 2) printf("[DIAG] Re-derived all constraint columns from original data\n");
+            }
+            
+            // Clamp negative RHS to zero (degenerate basic variables)
             for (int r = 0; r < nCons; r++) {
                 if (tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)] < 0.0) {
                     tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)] = 0.0;
@@ -1871,7 +1914,7 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
             // Copy back to device
             CUDA_CHECK(cudaMemcpy(tab->data, tab->hostData,
                                   tab->rows * tab->cols * sizeof(double), cudaMemcpyHostToDevice));
-            if (g_verbose >= 2) printf("[DIAG] Refined RHS before Phase 2\n");
+            if (g_verbose >= 2) printf("[DIAG] Phase 2 tableau prepared\n");
         }
         
         setupPhase2(tab, originalObjective);
@@ -1925,6 +1968,9 @@ void printSolution(Tableau* tab, LPProblem* lp, SimplexStatus status) {
             return;
         case UNBOUNDED:
             printf("Status: UNBOUNDED\n");
+            return;
+        case TIMEOUT:
+            printf("Status: TIMEOUT\n");
             return;
         case ERROR:
             printf("Status: ERROR\n");
@@ -1997,6 +2043,7 @@ static const char* statusString(SimplexStatus status) {
         case OPTIMAL:    return "OPTIMAL";
         case INFEASIBLE: return "INFEASIBLE";
         case UNBOUNDED:  return "UNBOUNDED";
+        case TIMEOUT:    return "TIMEOUT";
         case ERROR:      return "ERROR";
         default:         return "UNKNOWN";
     }
@@ -2193,19 +2240,140 @@ LPProblem* createTestProblem() {
     return lp;
 }
 
+// ===========================================================================
+// INTERACTIVE MODE
+// ===========================================================================
+
+/**
+ * Solve a single file (shared logic for interactive + normal mode).
+ * Returns the exit code (0 = OPTIMAL, 1 = other).
+ */
+int solveFile(const char* filename, cudaDeviceProp* prop) {
+    LPProblem* lp = parseMPS(filename);
+    if (!lp) return EXIT_FAILURE;
+    
+    preprocessBounds(lp);
+    Tableau* tab = createTableau(lp);
+    
+    g_totalIterations = 0;
+    double tstart = hpc_gettime();
+    SimplexStatus status = solveSimplex(tab, lp);
+    double elapsed = hpc_gettime() - tstart;
+    
+    outputSolution(tab, lp, status, elapsed);
+    
+    freeTableau(tab);
+    freeLPProblem(lp);
+    return (status == OPTIMAL) ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+/**
+ * Interactive REPL.
+ * Commands: help, quit/exit, set <option> <value>, or a filename to solve.
+ */
+void interactiveMode(cudaDeviceProp* prop) {
+    char line[1024];
+    
+    printf("CUDA Simplex — Interactive Mode\n");
+    printf("Type a .mps filename to solve, or 'help' for commands.\n\n");
+    
+    while (1) {
+        printf("simplex> ");
+        fflush(stdout);
+        
+        if (!fgets(line, sizeof(line), stdin)) {
+            printf("\n");
+            break;  // EOF
+        }
+        
+        // Strip trailing newline
+        int len = (int)strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+            line[--len] = '\0';
+        
+        // Skip empty lines
+        if (len == 0) continue;
+        
+        // Commands
+        if (strcmp(line, "quit") == 0 || strcmp(line, "exit") == 0) {
+            break;
+        } else if (strcmp(line, "help") == 0) {
+            printf("Commands:\n");
+            printf("  <file.mps>              Solve an MPS file\n");
+            printf("  set verbose <0|1|2>     Set verbosity level\n");
+            printf("  set debug <0|1>         Toggle tableau printing\n");
+            printf("  set format <text|json|csv>  Output format\n");
+            printf("  set maxiter <N>         Max iterations\n");
+            printf("  set timeout <seconds>   Solve timeout (0=off)\n");
+            printf("  status                  Show current settings\n");
+            printf("  quit / exit             Exit\n");
+        } else if (strcmp(line, "status") == 0) {
+            printf("  verbose  = %d\n", g_verbose);
+            printf("  debug    = %d\n", g_debug);
+            printf("  format   = %s\n",
+                   g_outputFormat == OUTPUT_JSON ? "json" :
+                   g_outputFormat == OUTPUT_CSV  ? "csv"  : "text");
+            printf("  maxiter  = %d\n", g_maxIter);
+            printf("  timeout  = %.1f s\n", g_timeout);
+            printf("  device   = %s\n", prop->name);
+        } else if (strncmp(line, "set ", 4) == 0) {
+            char key[64], val[64];
+            if (sscanf(line + 4, "%63s %63s", key, val) == 2) {
+                if (strcmp(key, "verbose") == 0) {
+                    g_verbose = atoi(val);
+                    printf("verbose = %d\n", g_verbose);
+                } else if (strcmp(key, "debug") == 0) {
+                    g_debug = atoi(val);
+                    printf("debug = %d\n", g_debug);
+                } else if (strcmp(key, "format") == 0) {
+                    if (strcmp(val, "json") == 0)      g_outputFormat = OUTPUT_JSON;
+                    else if (strcmp(val, "csv") == 0)  g_outputFormat = OUTPUT_CSV;
+                    else                               g_outputFormat = OUTPUT_TEXT;
+                    printf("format = %s\n", val);
+                } else if (strcmp(key, "maxiter") == 0) {
+                    g_maxIter = atoi(val);
+                    printf("maxiter = %d\n", g_maxIter);
+                } else if (strcmp(key, "timeout") == 0) {
+                    g_timeout = atof(val);
+                    printf("timeout = %.1f s\n", g_timeout);
+                } else {
+                    printf("Unknown option: %s\n", key);
+                }
+            } else {
+                printf("Usage: set <option> <value>\n");
+            }
+        } else {
+            // Treat as filename
+            struct stat st;
+            if (stat(line, &st) != 0) {
+                printf("File not found: %s\n", line);
+                continue;
+            }
+            solveFile(line, prop);
+        }
+    }
+}
+
 void printUsage(const char* progName) {
     fprintf(stderr, "CUDA Two-Phase Simplex Solver\n\n");
     fprintf(stderr, "Usage: %s [options] <problem.mps> [...]\n\n", progName);
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -s, --silent       Suppress solver output\n");
-    fprintf(stderr, "  -d, --diag         Enable diagnostic output\n");
-    fprintf(stderr, "  --json             Output solution in JSON format\n");
-    fprintf(stderr, "  --csv              Output solution in CSV format\n");
-    fprintf(stderr, "  --batch            Batch mode: solve multiple files, print summary\n");
-    fprintf(stderr, "  --log <file>       Write per-iteration log to CSV file\n");
-    fprintf(stderr, "  -h, --help         Show this help message\n\n");
+    fprintf(stderr, "  -s, --silent         Suppress solver output\n");
+    fprintf(stderr, "  -d, --debug          Print initial, intermediate, and final tableaux\n");
+    fprintf(stderr, "  --diag               Enable diagnostic output (verbose=2)\n");
+    fprintf(stderr, "  -i, --interactive    Interactive REPL mode\n");
+    fprintf(stderr, "  -m, --max-iter <N>   Set maximum iterations (default: 50000)\n");
+    fprintf(stderr, "  -t, --timeout <sec>  Set solve timeout in seconds (0=off)\n");
+    fprintf(stderr, "  --json               Output solution in JSON format\n");
+    fprintf(stderr, "  --csv                Output solution in CSV format\n");
+    fprintf(stderr, "  --batch              Batch mode: solve multiple files, print summary\n");
+    fprintf(stderr, "  --log <file>         Write per-iteration log to CSV file\n");
+    fprintf(stderr, "  -h, --help           Show this help message\n\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s problem.mps\n", progName);
+    fprintf(stderr, "  %s -d problem.mps              # show all tableaux\n", progName);
+    fprintf(stderr, "  %s -m 1000 -t 5 problem.mps    # max 1000 iters, 5s timeout\n", progName);
+    fprintf(stderr, "  %s -i                           # interactive mode\n", progName);
     fprintf(stderr, "  %s --json problem.mps\n", progName);
     fprintf(stderr, "  %s --batch netlib/*.mps\n", progName);
     fprintf(stderr, "  %s --batch netlib/\n", progName);
@@ -2215,6 +2383,7 @@ void printUsage(const char* progName) {
 int main(int argc, char* argv[]) {
     // Parse flags
     int batchMode = 0;
+    int interactiveFlag = 0;
     const char* logFile = NULL;
     int inputCount = 0;
     const char** inputFiles = (const char**)malloc(argc * sizeof(const char*));
@@ -2222,8 +2391,28 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--silent") == 0) {
             g_verbose = 0;
-        } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--diag") == 0) {
+        } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
+            g_debug = 1;
+        } else if (strcmp(argv[i], "--diag") == 0) {
             g_verbose = 2;
+        } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) {
+            interactiveFlag = 1;
+        } else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--max-iter") == 0) {
+            if (i + 1 < argc) {
+                g_maxIter = atoi(argv[++i]);
+                if (g_maxIter <= 0) { fprintf(stderr, "Error: --max-iter must be positive\n"); free(inputFiles); return EXIT_FAILURE; }
+            } else {
+                fprintf(stderr, "Error: --max-iter requires an integer argument\n");
+                free(inputFiles); return EXIT_FAILURE;
+            }
+        } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--timeout") == 0) {
+            if (i + 1 < argc) {
+                g_timeout = atof(argv[++i]);
+                if (g_timeout < 0.0) { fprintf(stderr, "Error: --timeout must be non-negative\n"); free(inputFiles); return EXIT_FAILURE; }
+            } else {
+                fprintf(stderr, "Error: --timeout requires a numeric argument\n");
+                free(inputFiles); return EXIT_FAILURE;
+            }
         } else if (strcmp(argv[i], "--json") == 0) {
             g_outputFormat = OUTPUT_JSON;
         } else if (strcmp(argv[i], "--csv") == 0) {
@@ -2317,6 +2506,14 @@ int main(int argc, char* argv[]) {
     }
     
     int exitCode = EXIT_SUCCESS;
+    
+    // ===== INTERACTIVE MODE =====
+    if (interactiveFlag) {
+        interactiveMode(&prop);
+        if (g_iterLog) fclose(g_iterLog);
+        free((void*)inputFiles);
+        return EXIT_SUCCESS;
+    }
     
     if (batchMode && inputCount > 0) {
         // ===== BATCH MODE =====
