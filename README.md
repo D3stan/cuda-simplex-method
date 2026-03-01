@@ -14,7 +14,13 @@ A GPU-accelerated implementation of the Simplex algorithm using CUDA, supporting
 
 ## Architecture
 
-The implementation follows the design from `implementazione.md`:
+The implementation follows the design from `implementazione.md` and is split into lightweight modules:
+
+- `core/`: shared types, constants, and runtime state (`SolverConfig`, `RunContext`)
+- `parser/`: MPS parsing + bounds/ranges preprocessing
+- `solver/`: CUDA kernels, tableau management, two-phase simplex logic
+- `io/`: text/JSON/CSV output and batch summaries
+- `app/`: CLI, interactive mode, and execution flow
 
 ### CUDA Kernels
 
@@ -39,19 +45,19 @@ The implementation follows the design from `implementazione.md`:
 ### Linux
 
 ```bash
-nvcc -o simplex simplex.cu -O3
+nvcc -O3 simplex.cu app/app.cu parser/parser.cu solver/kernels.cu solver/solver.cu io/io.cu -o simplex
 ```
 
 ### Windows (Visual Studio Developer Command Prompt)
 
 ```bash
-nvcc -o simplex.exe simplex.cu -O3
+nvcc -O3 simplex.cu app/app.cu parser/parser.cu solver/kernels.cu solver/solver.cu io/io.cu -o simplex.exe
 ```
 
 ### With explicit C++14 (if needed)
 
 ```bash
-nvcc -o simplex simplex.cu -O3 -std=c++14
+nvcc -O3 -std=c++14 simplex.cu app/app.cu parser/parser.cu solver/kernels.cu solver/solver.cu io/io.cu -o simplex
 ```
 
 ## Usage
