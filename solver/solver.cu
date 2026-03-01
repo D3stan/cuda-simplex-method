@@ -338,6 +338,153 @@ void setupPhase2(Tableau* tab, const double* originalObjective) {
                           tab->rows * tab->cols * sizeof(double), cudaMemcpyHostToDevice));
 }
 
+static int pivotOnHost(Tableau* tab, int pivotRow, int pivotCol) {
+    double pivot = tab->hostData[pivotRow * tab->cols + pivotCol];
+    if (fabs(pivot) <= EPSILON) return 0;
+
+    for (int j = 0; j < tab->cols; j++) {
+        tab->hostData[pivotRow * tab->cols + j] /= pivot;
+    }
+
+    for (int i = 0; i < tab->rows; i++) {
+        if (i == pivotRow) continue;
+        double factor = tab->hostData[i * tab->cols + pivotCol];
+        if (fabs(factor) <= EPSILON) continue;
+        for (int j = 0; j < tab->cols; j++) {
+            tab->hostData[i * tab->cols + j] -= factor * tab->hostData[pivotRow * tab->cols + j];
+        }
+    }
+
+    return 1;
+}
+
+static int eliminateDegenerateArtificialRowCol(Tableau* tab, int constraintRowIdx, int artCol) {
+    int oldRows = tab->rows;
+    int oldCols = tab->cols;
+    int removeRow = constraintRowIdx + 1;
+    int newRows = oldRows - 1;
+    int newCols = oldCols - 1;
+
+    if (newRows < 2 || newCols < 2) return 0;
+
+    double* newHostData = (double*)calloc(newRows * newCols, sizeof(double));
+    int* newHostBasicVars = (int*)malloc((newRows - 1) * sizeof(int));
+    if (!newHostData || !newHostBasicVars) {
+        free(newHostData);
+        free(newHostBasicVars);
+        return 0;
+    }
+
+    int nr = 0;
+    for (int r = 0; r < oldRows; r++) {
+        if (r == removeRow) continue;
+        int nc = 0;
+        for (int c = 0; c < oldCols; c++) {
+            if (c == artCol) continue;
+            newHostData[nr * newCols + nc] = tab->hostData[r * oldCols + c];
+            nc++;
+        }
+        nr++;
+    }
+
+    int nb = 0;
+    for (int i = 0; i < oldRows - 1; i++) {
+        if (i == constraintRowIdx) continue;
+        int bv = tab->hostBasicVars[i];
+        if (bv == artCol) {
+            free(newHostData);
+            free(newHostBasicVars);
+            return 0;
+        }
+        if (bv > artCol) bv--;
+        newHostBasicVars[nb++] = bv;
+    }
+
+    free(tab->hostData);
+    free(tab->hostBasicVars);
+    CUDA_CHECK(cudaFree(tab->data));
+    CUDA_CHECK(cudaFree(tab->basicVars));
+
+    tab->hostData = newHostData;
+    tab->hostBasicVars = newHostBasicVars;
+    tab->rows = newRows;
+    tab->cols = newCols;
+    tab->numArtificial--;
+
+    CUDA_CHECK(cudaMalloc(&tab->data, tab->rows * tab->cols * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&tab->basicVars, (tab->rows - 1) * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(tab->data, tab->hostData,
+                          tab->rows * tab->cols * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(tab->basicVars, tab->hostBasicVars,
+                          (tab->rows - 1) * sizeof(int), cudaMemcpyHostToDevice));
+
+    return 1;
+}
+
+// Return bitmask: 1 = changed by pivot, 2 = reduced tableau size by row/col elimination
+static int extractArtificialBasis(Tableau* tab, SolverConfig* config) {
+    syncTableauToHost(tab);
+
+    int status = 0;
+    while (1) {
+        int changedThisPass = 0;
+        int artificialStart = tab->numOriginalVars + tab->numSlack;
+        int artificialEnd = artificialStart + tab->numArtificial;
+        int rhsCol = tab->cols - 1;
+
+        for (int i = 0; i < tab->rows - 1; i++) {
+            int basicVar = tab->hostBasicVars[i];
+            if (basicVar < artificialStart || basicVar >= artificialEnd) continue;
+
+            int row = i + 1;
+            int entering = -1;
+            for (int j = 0; j < artificialStart; j++) {
+                if (fabs(tab->hostData[row * tab->cols + j]) > EPSILON) {
+                    entering = j;
+                    break;
+                }
+            }
+
+            if (entering >= 0) {
+                if (!pivotOnHost(tab, row, entering)) return -1;
+                tab->hostBasicVars[i] = entering;
+                changedThisPass = 1;
+                status |= 1;
+                if (g_verbose >= 2) {
+                    printf("[DIAG] Extracted artificial var via pivot: row %d, enter col %d\n", row, entering);
+                }
+                break;
+            }
+
+            double rhsVal = tab->hostData[row * tab->cols + rhsCol];
+            if (fabs(rhsVal) > 1e-8) {
+                if (g_verbose) {
+                    printf("Error: Artificial variable in basis has non-zero value (row %d, rhs %.6e)\n",
+                           row, rhsVal);
+                }
+                return -1;
+            }
+
+            if (!eliminateDegenerateArtificialRowCol(tab, i, basicVar)) return -1;
+            changedThisPass = 1;
+            status |= 2;
+            if (g_verbose >= 2) {
+                printf("[DIAG] Removed degenerate row %d and artificial column %d\n", row, basicVar);
+            }
+            break;
+        }
+
+        if (!changedThisPass) break;
+    }
+
+    CUDA_CHECK(cudaMemcpy(tab->data, tab->hostData,
+                          tab->rows * tab->cols * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(tab->basicVars, tab->hostBasicVars,
+                          (tab->rows - 1) * sizeof(int), cudaMemcpyHostToDevice));
+
+    return status;
+}
+
 /**
  * Re-derive the objective row from scratch using the phase cost vector.
  *
@@ -751,20 +898,20 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
             return INFEASIBLE;
         }
         
-        // Check if any artificial variable is still in basis
-        int artificialStart = tab->numOriginalVars + tab->numSlack;
-        for (int i = 0; i < tab->rows - 1; i++) {
-            if (tab->hostBasicVars[i] >= artificialStart) {
-                if (g_verbose)
-                    printf("Warning: Artificial variable %d still in basis (degenerate)\n",
-                           tab->hostBasicVars[i]);
-            }
+        int extractionStatus = extractArtificialBasis(tab, config);
+        if (extractionStatus < 0) {
+            if (g_verbose) printf("Error: Failed to extract degenerate artificial basis\n");
+            free(originalObjective);
+            return ERROR;
+        }
+        if (extractionStatus != 0 && g_verbose) {
+            printf("Artificial basis cleanup completed before Phase 2\n");
         }
         
         if (g_verbose) printf("\n--- Phase 2: Optimizing original objective ---\n");
         
         // Remove symbolic perturbation and optionally re-derive entire tableau before Phase 2
-        {
+        if ((extractionStatus & 2) == 0) {
             syncTableauToHost(tab);
             int artStart = tab->numOriginalVars + tab->numSlack;
             int nCons = tab->rows - 1;
@@ -895,6 +1042,8 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
             CUDA_CHECK(cudaMemcpy(tab->data, tab->hostData,
                                   tab->rows * tab->cols * sizeof(double), cudaMemcpyHostToDevice));
             if (g_verbose >= 2) printf("[DIAG] Phase 2 tableau prepared\n");
+        } else if (g_verbose >= 2) {
+            printf("[DIAG] Skipped B^-1-based Phase 2 preparation after row/column elimination\n");
         }
         
         setupPhase2(tab, originalObjective);
