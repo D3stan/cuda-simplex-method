@@ -932,6 +932,29 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
             int artStart = tab->numOriginalVars + tab->numSlack;
             int nCons = tab->rows - 1;
             
+            // Build mapping: constraint index → initial basis column
+            // B^{-1} is stored in the columns of the initial basis variables,
+            // which are slack columns for LE constraints and artificial columns
+            // for GE/EQ constraints.
+            int* initialBasisCol = (int*)malloc(nCons * sizeof(int));
+            {
+                int sIdx = lp->numVars;
+                int aIdx = artStart;
+                for (int c = 0; c < nCons; c++) {
+                    if (lp->constraintTypes[c] == CONSTRAINT_LE) {
+                        initialBasisCol[c] = sIdx;
+                        sIdx++;
+                    } else if (lp->constraintTypes[c] == CONSTRAINT_GE) {
+                        sIdx++;  // skip surplus column
+                        initialBasisCol[c] = aIdx;
+                        aIdx++;
+                    } else { // CONSTRAINT_EQ
+                        initialBasisCol[c] = aIdx;
+                        aIdx++;
+                    }
+                }
+            }
+            
             // Precompute variable-to-constraint mapping for slack/surplus/artificial
             int* varToConstraint = (int*)malloc(tab->cols * sizeof(int));
             double* varCoeffSign = (double*)malloc(tab->cols * sizeof(double));
@@ -957,7 +980,7 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
             for (int r = 0; r < nCons; r++) {
                 double correction = 0.0;
                 for (int j = 0; j < nCons; j++) {
-                    double bij = tab->hostData[(r + 1) * tab->cols + (artStart + j)];
+                    double bij = tab->hostData[(r + 1) * tab->cols + initialBasisCol[j]];
                     correction += bij * (j + 1) * PERTURB_EPS;
                 }
                 tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)] -= correction;
@@ -985,7 +1008,7 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
                 for (int r = 0; r < nCons; r++) {
                     double corr = 0.0;
                     for (int j = 0; j < nCons; j++) {
-                        double bij = tab->hostData[(r + 1) * tab->cols + (artStart + j)];
+                        double bij = tab->hostData[(r + 1) * tab->cols + initialBasisCol[j]];
                         corr += bij * residual[j];
                     }
                     if (fabs(corr) > maxCorrection) maxCorrection = fabs(corr);
@@ -997,7 +1020,7 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
                     for (int r = 0; r < nCons; r++) {
                         double corr = 0.0;
                         for (int j = 0; j < nCons; j++) {
-                            double bij = tab->hostData[(r + 1) * tab->cols + (artStart + j)];
+                            double bij = tab->hostData[(r + 1) * tab->cols + initialBasisCol[j]];
                             corr += bij * residual[j];
                         }
                         tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)] += corr;
@@ -1021,7 +1044,7 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
                     for (int r = 0; r < nCons; r++) {
                         double val = 0.0;
                         for (int k = 0; k < nCons; k++) {
-                            double bij = tab->hostData[(r + 1) * tab->cols + (artStart + k)];
+                            double bij = tab->hostData[(r + 1) * tab->cols + initialBasisCol[k]];
                             val += bij * lp->constraintMatrix[k][j];
                         }
                         tab->hostData[(r + 1) * tab->cols + j] = val;
@@ -1036,7 +1059,7 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
                     if (cons >= 0) {
                         for (int r = 0; r < nCons; r++) {
                             tab->hostData[(r + 1) * tab->cols + j] = 
-                                sign * tab->hostData[(r + 1) * tab->cols + (artStart + cons)];
+                                sign * tab->hostData[(r + 1) * tab->cols + initialBasisCol[cons]];
                         }
                     }
                 }
@@ -1045,6 +1068,7 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
                 if (g_verbose >= 2) printf("[DIAG] Re-derived all constraint columns\n");
             }
             
+            free(initialBasisCol);
             free(varToConstraint);
             free(varCoeffSign);
             
