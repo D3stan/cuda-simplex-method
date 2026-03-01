@@ -465,6 +465,22 @@ static int extractArtificialBasis(Tableau* tab, SolverConfig* config) {
                 return -1;
             }
 
+            int safeToDrop = 1;
+            for (int c = 0; c < tab->cols - 1; c++) {
+                if (c == basicVar) continue;
+                if (fabs(tab->hostData[row * tab->cols + c]) > 1e-8) {
+                    safeToDrop = 0;
+                    break;
+                }
+            }
+
+            if (!safeToDrop) {
+                if (g_verbose >= 2) {
+                    printf("[DIAG] Kept degenerate artificial in basis at row %d (row not removable safely)\n", row);
+                }
+                continue;
+            }
+
             if (!eliminateDegenerateArtificialRowCol(tab, i, basicVar)) return -1;
             changedThisPass = 1;
             status |= 2;
@@ -1046,15 +1062,24 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
             printf("[DIAG] Skipped B^-1-based Phase 2 preparation after row/column elimination\n");
         }
         
-        setupPhase2(tab, originalObjective);
+        double* phase2Objective = (double*)calloc(tab->cols, sizeof(double));
+        double objSign = (lp->sense == MAXIMIZE) ? -1.0 : 1.0;
+        int objVars = lp->numVars;
+        if (objVars > tab->numOriginalVars) objVars = tab->numOriginalVars;
+        for (int j = 0; j < objVars; j++) {
+            phase2Objective[j] = objSign * lp->objCoeffs[j];
+        }
+
+        setupPhase2(tab, phase2Objective);
         
         // Build Phase 2 cost vector for periodic re-derivation
         // Use 0 for artificial variables — blocking is handled by rederiveObjectiveRow's blockArt flag
         double* phase2Costs = (double*)calloc(tab->cols, sizeof(double));
-        memcpy(phase2Costs, originalObjective, tab->cols * sizeof(double));
+        memcpy(phase2Costs, phase2Objective, tab->cols * sizeof(double));
         // Artificials get cost 0 to avoid Big-M numerical amplification
         // They are blocked from re-entering by rederiveObjectiveRow(blockArt=1)
-        
+
+        free(phase2Objective);
         free(originalObjective);
         
         // Phase 2
