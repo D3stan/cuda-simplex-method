@@ -41,14 +41,14 @@ const char* statusString(SimplexStatus status) {
 /**
  * Print solution in JSON format
  */
-void printSolutionJSON(Tableau* tab, LPProblem* lp, SimplexStatus status, double elapsed) {
+void printSolutionJSON(Tableau* tab, LPProblem* lp, SimplexStatus status, double elapsed, const RunContext* run) {
     printf("{\n");
     printf("  \"problem\": \"%s\",\n", lp->name);
     printf("  \"status\": \"%s\",\n", statusString(status));
     printf("  \"variables\": %d,\n", lp->numVars);
     printf("  \"constraints\": %d,\n", lp->numConstraints);
     printf("  \"sense\": \"%s\",\n", lp->sense == MAXIMIZE ? "maximize" : "minimize");
-    printf("  \"iterations\": %d,\n", g_totalIterations);
+    printf("  \"iterations\": %d,\n", run ? run->totalIterations : 0);
     printf("  \"elapsed_seconds\": %.6f", elapsed);
     
     if (status == OPTIMAL) {
@@ -76,7 +76,7 @@ void printSolutionJSON(Tableau* tab, LPProblem* lp, SimplexStatus status, double
 /**
  * Print solution in CSV format (one header + one data row)
  */
-void printSolutionCSV(Tableau* tab, LPProblem* lp, SimplexStatus status, double elapsed) {
+void printSolutionCSV(Tableau* tab, LPProblem* lp, SimplexStatus status, double elapsed, const RunContext* run) {
     printf("problem,status,variables,constraints,sense,iterations,elapsed_seconds,objective_value\n");
     
     double objValue = 0.0;
@@ -90,25 +90,26 @@ void printSolutionCSV(Tableau* tab, LPProblem* lp, SimplexStatus status, double 
            lp->name, statusString(status),
            lp->numVars, lp->numConstraints,
            lp->sense == MAXIMIZE ? "maximize" : "minimize",
-           g_totalIterations, elapsed, objValue);
+           run ? run->totalIterations : 0, elapsed, objValue);
 }
 
 /**
- * Dispatch solution output based on g_outputFormat
+ * Dispatch solution output based on selected format
  */
-void outputSolution(Tableau* tab, LPProblem* lp, SimplexStatus status, double elapsed) {
-    switch (g_outputFormat) {
+void outputSolution(Tableau* tab, LPProblem* lp, SimplexStatus status, double elapsed, const SolverConfig* config, const RunContext* run) {
+    OutputFormat format = config ? config->outputFormat : OUTPUT_TEXT;
+    switch (format) {
         case OUTPUT_JSON:
-            printSolutionJSON(tab, lp, status, elapsed);
+            printSolutionJSON(tab, lp, status, elapsed, run);
             break;
         case OUTPUT_CSV:
-            printSolutionCSV(tab, lp, status, elapsed);
+            printSolutionCSV(tab, lp, status, elapsed, run);
             break;
         case OUTPUT_TEXT:
         default:
             printSolution(tab, lp, status);
             printf("\nElapsed time: %.6f seconds\n", elapsed);
-            printf("Total iterations: %d\n", g_totalIterations);
+            printf("Total iterations: %d\n", run ? run->totalIterations : 0);
             break;
     }
 }

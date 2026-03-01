@@ -3,8 +3,8 @@
 
 #include "../core/simplex_core.h"
 
-LPProblem* parseMPS(const char* filename);
-void preprocessBounds(LPProblem* lp);
+LPProblem* parseMPS(const char* filename, const SolverConfig* config);
+void preprocessBounds(LPProblem* lp, const SolverConfig* config);
 void freeLPProblem(LPProblem* lp);
 LPProblem* createTestProblem();
 

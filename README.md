@@ -48,6 +48,19 @@ The implementation follows the design from `implementazione.md` and is split int
 nvcc -O3 simplex.cu app/app.cu parser/parser.cu solver/kernels.cu solver/solver.cu io/io.cu -o simplex
 ```
 
+### Makefile (consigliato)
+
+```bash
+make
+```
+
+Comandi utili:
+
+```bash
+make clean
+make run
+```
+
 ### Windows (Visual Studio Developer Command Prompt)
 
 ```bash

@@ -96,17 +96,4 @@ typedef struct {
     double solveStartTime;
 } RunContext;
 
-extern SolverConfig g_config;
-extern RunContext g_run;
-
-#define g_verbose (g_config.verbose)
-#define g_outputFormat (g_config.outputFormat)
-#define g_iterLog (g_config.iterLog)
-#define g_debug (g_config.debug)
-#define g_maxIter (g_config.maxIter)
-#define g_timeout (g_config.timeout)
-#define g_phase (g_run.phase)
-#define g_totalIterations (g_run.totalIterations)
-#define g_solveStartTime (g_run.solveStartTime)
-
 #endif

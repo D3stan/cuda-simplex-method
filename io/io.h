@@ -14,9 +14,9 @@ typedef struct {
 } BatchResult;
 
 void printSolution(Tableau* tab, LPProblem* lp, SimplexStatus status);
-void printSolutionJSON(Tableau* tab, LPProblem* lp, SimplexStatus status, double elapsed);
-void printSolutionCSV(Tableau* tab, LPProblem* lp, SimplexStatus status, double elapsed);
-void outputSolution(Tableau* tab, LPProblem* lp, SimplexStatus status, double elapsed);
+void printSolutionJSON(Tableau* tab, LPProblem* lp, SimplexStatus status, double elapsed, const RunContext* run);
+void printSolutionCSV(Tableau* tab, LPProblem* lp, SimplexStatus status, double elapsed, const RunContext* run);
+void outputSolution(Tableau* tab, LPProblem* lp, SimplexStatus status, double elapsed, const SolverConfig* config, const RunContext* run);
 
 void printBatchSummaryText(BatchResult* results, int count);
 void printBatchSummaryJSON(BatchResult* results, int count);

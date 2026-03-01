@@ -6,13 +6,23 @@ extern __global__ void kernelFindPivotRow(const double*, int, int, int, double*,
 extern __global__ void kernelUpdateTableau(double*, int, int, int, int, const double*, const double*);
 extern __global__ void kernelCachePivotData(const double*, int, int, int, int, double*, double*);
 
+#define g_verbose (config->verbose)
+#define g_outputFormat (config->outputFormat)
+#define g_iterLog (config->iterLog)
+#define g_debug (config->debug)
+#define g_maxIter (config->maxIter)
+#define g_timeout (config->timeout)
+#define g_phase (run->phase)
+#define g_totalIterations (run->totalIterations)
+#define g_solveStartTime (run->solveStartTime)
+
 // ===========================================================================
 
 /**
  * Create and initialize the tableau from LP problem
  * Handles slack, surplus, and artificial variables
  */
-Tableau* createTableau(LPProblem* lp) {
+Tableau* createTableau(LPProblem* lp, const SolverConfig* config) {
     Tableau* tab = (Tableau*)malloc(sizeof(Tableau));
     
     // Pre-pass: flip constraints with negative RHS so that b >= 0
@@ -379,7 +389,7 @@ void rederiveObjectiveRow(Tableau* tab, const double* phaseCosts, int blockArt) 
  *                    Used for periodic objective row re-derivation.
  *                    Pass NULL to disable re-derivation (not recommended).
  */
-SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* phaseCosts, int blockArt) {
+SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* phaseCosts, int blockArt, SolverConfig* config, RunContext* run) {
     // Allocate device memory for kernel outputs
     double *d_minVal, *d_minRatio;
     int *d_pivotCol, *d_pivotRow;
@@ -653,7 +663,7 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* pha
 /**
  * Main two-phase simplex solver
  */
-SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
+SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, RunContext* run) {
     if (g_verbose) printf("\n=== Starting Two-Phase Simplex Method ===\n");
     
     int maxIterations = g_maxIter;
@@ -696,7 +706,7 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
         }
         
         g_phase = 1;
-        SimplexStatus phase1Status = runSimplexPhase(tab, maxIterations, phase1Costs, 0);
+        SimplexStatus phase1Status = runSimplexPhase(tab, maxIterations, phase1Costs, 0, config, run);
         free(phase1Costs);
         
         if (phase1Status == UNBOUNDED) {
@@ -900,7 +910,7 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
         
         // Phase 2
         g_phase = 2;
-        SimplexStatus status = runSimplexPhase(tab, maxIterations, phase2Costs, 1);
+        SimplexStatus status = runSimplexPhase(tab, maxIterations, phase2Costs, 1, config, run);
         free(phase2Costs);
         return status;
     } else {
@@ -918,7 +928,7 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp) {
     }
     
     g_phase = 0;
-    SimplexStatus status = runSimplexPhase(tab, maxIterations, phaseCosts, 0);
+    SimplexStatus status = runSimplexPhase(tab, maxIterations, phaseCosts, 0, config, run);
     free(phaseCosts);
     return status;
 }

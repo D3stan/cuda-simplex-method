@@ -51,7 +51,7 @@ static int isMPSSectionHeader(const char* line) {
  * Handles: ROWS, COLUMNS, RHS, BOUNDS, RANGES, OBJSENSE, integer MARKERs.
  * Stops strictly at ENDATA.
  */
-LPProblem* parseMPS(const char* filename) {
+LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
     FILE* file = fopen(filename, "r");
     if (!file) {
         fprintf(stderr, "Error: Cannot open file %s\n", filename);
@@ -460,7 +460,7 @@ LPProblem* parseMPS(const char* filename) {
     free(rowNames);   // Individual names transferred; only free the pointer array
     if (objRowName) free(objRowName);
     
-    if (g_verbose) {
+    if (config && config->verbose) {
         printf("Parsed LP: %s\n", lp->name);
         printf("  Variables: %d\n", lp->numVars);
         printf("  Constraints: %d\n", lp->numConstraints);
@@ -481,7 +481,7 @@ LPProblem* parseMPS(const char* filename) {
  *   3. Add upper-bound constraints (x_j <= ub)
  *   4. Expand range constraints into pairs of inequalities
  */
-void preprocessBounds(LPProblem* lp) {
+void preprocessBounds(LPProblem* lp, const SolverConfig* config) {
     if (!lp->lowerBounds || !lp->upperBounds) return;
     
     int origVars = lp->numVars;
@@ -638,7 +638,7 @@ void preprocessBounds(LPProblem* lp) {
         lp->numConstraints = newNumConstraints;
     }
     
-    if (g_verbose) {
+    if (config && config->verbose) {
         printf("After bound preprocessing:\n");
         printf("  Variables: %d (was %d)\n", lp->numVars, origVars);
         printf("  Constraints: %d (was %d)\n", lp->numConstraints, origConstraints);

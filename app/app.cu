@@ -4,28 +4,25 @@
 #include "../io/io.h"
 #include "../hpc.h"
 
-SolverConfig g_config = {1, OUTPUT_TEXT, NULL, 0, 50000, 0.0};
-RunContext g_run = {0, 0, 0.0};
-
 // ===========================================================================
 
 /**
  * Solve a single file (shared logic for interactive + normal mode).
  * Returns the exit code (0 = OPTIMAL, 1 = other).
  */
-int solveFile(const char* filename, cudaDeviceProp* prop) {
-    LPProblem* lp = parseMPS(filename);
+int solveFile(const char* filename, cudaDeviceProp* prop, SolverConfig* config, RunContext* run) {
+    LPProblem* lp = parseMPS(filename, config);
     if (!lp) return EXIT_FAILURE;
     
-    preprocessBounds(lp);
-    Tableau* tab = createTableau(lp);
+    preprocessBounds(lp, config);
+    Tableau* tab = createTableau(lp, config);
     
-    g_totalIterations = 0;
+    run->totalIterations = 0;
     double tstart = hpc_gettime();
-    SimplexStatus status = solveSimplex(tab, lp);
+    SimplexStatus status = solveSimplex(tab, lp, config, run);
     double elapsed = hpc_gettime() - tstart;
     
-    outputSolution(tab, lp, status, elapsed);
+    outputSolution(tab, lp, status, elapsed, config, run);
     
     freeTableau(tab);
     freeLPProblem(lp);
@@ -36,7 +33,7 @@ int solveFile(const char* filename, cudaDeviceProp* prop) {
  * Interactive REPL.
  * Commands: help, quit/exit, set <option> <value>, or a filename to solve.
  */
-void interactiveMode(cudaDeviceProp* prop) {
+void interactiveMode(cudaDeviceProp* prop, SolverConfig* config, RunContext* run) {
     char line[1024];
     
     printf("CUDA Simplex — Interactive Mode\n");
@@ -73,34 +70,34 @@ void interactiveMode(cudaDeviceProp* prop) {
             printf("  status                  Show current settings\n");
             printf("  quit / exit             Exit\n");
         } else if (strcmp(line, "status") == 0) {
-            printf("  verbose  = %d\n", g_verbose);
-            printf("  debug    = %d\n", g_debug);
+            printf("  verbose  = %d\n", config->verbose);
+            printf("  debug    = %d\n", config->debug);
             printf("  format   = %s\n",
-                   g_outputFormat == OUTPUT_JSON ? "json" :
-                   g_outputFormat == OUTPUT_CSV  ? "csv"  : "text");
-            printf("  maxiter  = %d\n", g_maxIter);
-            printf("  timeout  = %.1f s\n", g_timeout);
+                   config->outputFormat == OUTPUT_JSON ? "json" :
+                   config->outputFormat == OUTPUT_CSV  ? "csv"  : "text");
+            printf("  maxiter  = %d\n", config->maxIter);
+            printf("  timeout  = %.1f s\n", config->timeout);
             printf("  device   = %s\n", prop->name);
         } else if (strncmp(line, "set ", 4) == 0) {
             char key[64], val[64];
             if (sscanf(line + 4, "%63s %63s", key, val) == 2) {
                 if (strcmp(key, "verbose") == 0) {
-                    g_verbose = atoi(val);
-                    printf("verbose = %d\n", g_verbose);
+                    config->verbose = atoi(val);
+                    printf("verbose = %d\n", config->verbose);
                 } else if (strcmp(key, "debug") == 0) {
-                    g_debug = atoi(val);
-                    printf("debug = %d\n", g_debug);
+                    config->debug = atoi(val);
+                    printf("debug = %d\n", config->debug);
                 } else if (strcmp(key, "format") == 0) {
-                    if (strcmp(val, "json") == 0)      g_outputFormat = OUTPUT_JSON;
-                    else if (strcmp(val, "csv") == 0)  g_outputFormat = OUTPUT_CSV;
-                    else                               g_outputFormat = OUTPUT_TEXT;
+                    if (strcmp(val, "json") == 0)      config->outputFormat = OUTPUT_JSON;
+                    else if (strcmp(val, "csv") == 0)  config->outputFormat = OUTPUT_CSV;
+                    else                                 config->outputFormat = OUTPUT_TEXT;
                     printf("format = %s\n", val);
                 } else if (strcmp(key, "maxiter") == 0) {
-                    g_maxIter = atoi(val);
-                    printf("maxiter = %d\n", g_maxIter);
+                    config->maxIter = atoi(val);
+                    printf("maxiter = %d\n", config->maxIter);
                 } else if (strcmp(key, "timeout") == 0) {
-                    g_timeout = atof(val);
-                    printf("timeout = %.1f s\n", g_timeout);
+                    config->timeout = atof(val);
+                    printf("timeout = %.1f s\n", config->timeout);
                 } else {
                     printf("Unknown option: %s\n", key);
                 }
@@ -114,7 +111,7 @@ void interactiveMode(cudaDeviceProp* prop) {
                 printf("File not found: %s\n", line);
                 continue;
             }
-            solveFile(line, prop);
+            solveFile(line, prop, config, run);
         }
     }
 }
@@ -147,6 +144,9 @@ void printUsage(const char* progName) {
 
 
 int runApp(int argc, char* argv[]) {
+    SolverConfig config = {1, OUTPUT_TEXT, NULL, 0, 50000, 0.0};
+    RunContext run = {0, 0, 0.0};
+
     // Parse flags
     int batchMode = 0;
     int interactiveFlag = 0;
@@ -156,33 +156,33 @@ int runApp(int argc, char* argv[]) {
     
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--silent") == 0) {
-            g_verbose = 0;
+            config.verbose = 0;
         } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
-            g_debug = 1;
+            config.debug = 1;
         } else if (strcmp(argv[i], "--diag") == 0) {
-            g_verbose = 2;
+            config.verbose = 2;
         } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) {
             interactiveFlag = 1;
         } else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--max-iter") == 0) {
             if (i + 1 < argc) {
-                g_maxIter = atoi(argv[++i]);
-                if (g_maxIter <= 0) { fprintf(stderr, "Error: --max-iter must be positive\n"); free(inputFiles); return EXIT_FAILURE; }
+                config.maxIter = atoi(argv[++i]);
+                if (config.maxIter <= 0) { fprintf(stderr, "Error: --max-iter must be positive\n"); free(inputFiles); return EXIT_FAILURE; }
             } else {
                 fprintf(stderr, "Error: --max-iter requires an integer argument\n");
                 free(inputFiles); return EXIT_FAILURE;
             }
         } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--timeout") == 0) {
             if (i + 1 < argc) {
-                g_timeout = atof(argv[++i]);
-                if (g_timeout < 0.0) { fprintf(stderr, "Error: --timeout must be non-negative\n"); free(inputFiles); return EXIT_FAILURE; }
+                config.timeout = atof(argv[++i]);
+                if (config.timeout < 0.0) { fprintf(stderr, "Error: --timeout must be non-negative\n"); free(inputFiles); return EXIT_FAILURE; }
             } else {
                 fprintf(stderr, "Error: --timeout requires a numeric argument\n");
                 free(inputFiles); return EXIT_FAILURE;
             }
         } else if (strcmp(argv[i], "--json") == 0) {
-            g_outputFormat = OUTPUT_JSON;
+            config.outputFormat = OUTPUT_JSON;
         } else if (strcmp(argv[i], "--csv") == 0) {
-            g_outputFormat = OUTPUT_CSV;
+            config.outputFormat = OUTPUT_CSV;
         } else if (strcmp(argv[i], "--batch") == 0) {
             batchMode = 1;
         } else if (strcmp(argv[i], "--log") == 0) {
@@ -240,16 +240,16 @@ int runApp(int argc, char* argv[]) {
     
     // Open iteration log if requested
     if (logFile) {
-        g_iterLog = fopen(logFile, "w");
-        if (!g_iterLog) {
+        config.iterLog = fopen(logFile, "w");
+        if (!config.iterLog) {
             fprintf(stderr, "Error: Cannot open log file %s\n", logFile);
             free((void*)inputFiles);
             return EXIT_FAILURE;
         }
-        fprintf(g_iterLog, "iter,phase,pivot_col,pivot_row,reduced_cost,ratio,obj_rhs\n");
+        fprintf(config.iterLog, "iter,phase,pivot_col,pivot_row,reduced_cost,ratio,obj_rhs\n");
     }
     
-    if (g_verbose && g_outputFormat == OUTPUT_TEXT) {
+    if (config.verbose && config.outputFormat == OUTPUT_TEXT) {
         printf("CUDA Two-Phase Simplex Solver\n");
         printf("=============================\n\n");
     }
@@ -259,14 +259,14 @@ int runApp(int argc, char* argv[]) {
     CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
     if (deviceCount == 0) {
         fprintf(stderr, "Error: No CUDA-capable device found!\n");
-        if (g_iterLog) fclose(g_iterLog);
+        if (config.iterLog) fclose(config.iterLog);
         free((void*)inputFiles);
         return EXIT_FAILURE;
     }
     
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-    if (g_verbose && g_outputFormat == OUTPUT_TEXT) {
+    if (config.verbose && config.outputFormat == OUTPUT_TEXT) {
         printf("Using CUDA device: %s\n", prop.name);
         printf("Compute capability: %d.%d\n\n", prop.major, prop.minor);
     }
@@ -275,16 +275,16 @@ int runApp(int argc, char* argv[]) {
     
     // ===== INTERACTIVE MODE =====
     if (interactiveFlag) {
-        interactiveMode(&prop);
-        if (g_iterLog) fclose(g_iterLog);
+        interactiveMode(&prop, &config, &run);
+        if (config.iterLog) fclose(config.iterLog);
         free((void*)inputFiles);
         return EXIT_SUCCESS;
     }
     
     if (batchMode && inputCount > 0) {
         // ===== BATCH MODE =====
-        int savedVerbose = g_verbose;
-        if (g_verbose < 2) g_verbose = 0;  // Silence per-problem output unless -d
+        int savedVerbose = config.verbose;
+        if (config.verbose < 2) config.verbose = 0;  // Silence per-problem output unless -d
         
         BatchResult* results = (BatchResult*)malloc(inputCount * sizeof(BatchResult));
         int resultCount = 0;
@@ -294,7 +294,7 @@ int runApp(int argc, char* argv[]) {
             const char* base = strrchr(inputFiles[f], '/');
             const char* displayName = base ? base + 1 : inputFiles[f];
             
-            LPProblem* lp = parseMPS(inputFiles[f]);
+            LPProblem* lp = parseMPS(inputFiles[f], &config);
             if (!lp) {
                 snprintf(results[resultCount].filename, sizeof(results[resultCount].filename),
                          "%s", displayName);
@@ -313,17 +313,17 @@ int runApp(int argc, char* argv[]) {
             results[resultCount].numVars = lp->numVars;
             results[resultCount].numConstraints = lp->numConstraints;
             
-            preprocessBounds(lp);
-            Tableau* tab = createTableau(lp);
+            preprocessBounds(lp, &config);
+            Tableau* tab = createTableau(lp, &config);
             
-            g_totalIterations = 0;
+            run.totalIterations = 0;
             
             double tstart = hpc_gettime();
-            SimplexStatus status = solveSimplex(tab, lp);
+            SimplexStatus status = solveSimplex(tab, lp, &config, &run);
             double elapsed = hpc_gettime() - tstart;
             
             results[resultCount].statusStr = statusString(status);
-            results[resultCount].iterations = g_totalIterations;
+            results[resultCount].iterations = run.totalIterations;
             results[resultCount].elapsed = elapsed;
             
             if (status == OPTIMAL) {
@@ -338,19 +338,19 @@ int runApp(int argc, char* argv[]) {
             freeLPProblem(lp);
             resultCount++;
             
-            if (savedVerbose && g_outputFormat == OUTPUT_TEXT) {
+            if (savedVerbose && config.outputFormat == OUTPUT_TEXT) {
                 fprintf(stderr, "\rSolved %d/%d problems...", resultCount, inputCount);
                 fflush(stderr);
             }
         }
         
-        if (savedVerbose && g_outputFormat == OUTPUT_TEXT)
+        if (savedVerbose && config.outputFormat == OUTPUT_TEXT)
             fprintf(stderr, "\r                              \r");
         
-        g_verbose = savedVerbose;
+        config.verbose = savedVerbose;
         
         // Print batch summary
-        switch (g_outputFormat) {
+        switch (config.outputFormat) {
             case OUTPUT_JSON:
                 printBatchSummaryJSON(results, resultCount);
                 break;
@@ -370,22 +370,22 @@ int runApp(int argc, char* argv[]) {
         LPProblem* lp = NULL;
         
         if (inputCount > 0) {
-            if (g_verbose && g_outputFormat == OUTPUT_TEXT)
+            if (config.verbose && config.outputFormat == OUTPUT_TEXT)
                 printf("Loading problem from: %s\n\n", inputFiles[0]);
-            lp = parseMPS(inputFiles[0]);
+            lp = parseMPS(inputFiles[0], &config);
             if (!lp) {
-                if (g_iterLog) fclose(g_iterLog);
+                if (config.iterLog) fclose(config.iterLog);
                 free((void*)inputFiles);
                 return EXIT_FAILURE;
             }
         } else {
-            if (g_outputFormat == OUTPUT_TEXT && g_verbose) {
+            if (config.outputFormat == OUTPUT_TEXT && config.verbose) {
                 printf("No input file provided. Using test problem.\n\n");
                 printf("Usage: %s [options] <problem.mps>\n\n", argv[0]);
             }
             lp = createTestProblem();
             
-            if (g_verbose && g_outputFormat == OUTPUT_TEXT) {
+            if (config.verbose && config.outputFormat == OUTPUT_TEXT) {
                 printf("Test Problem:\n");
                 printf("  Maximize: 3*x1 + 2*x2\n");
                 printf("  Subject to:\n");
@@ -396,24 +396,24 @@ int runApp(int argc, char* argv[]) {
         }
         
         // Preprocess variable bounds and range constraints
-        preprocessBounds(lp);
+        preprocessBounds(lp, &config);
         
         // Create tableau
-        Tableau* tab = createTableau(lp);
+        Tableau* tab = createTableau(lp, &config);
         
-        g_totalIterations = 0;
+        run.totalIterations = 0;
         
         // Time only the computation (solving), not I/O
         double tstart = hpc_gettime();
         
         // Solve
-        SimplexStatus status = solveSimplex(tab, lp);
+        SimplexStatus status = solveSimplex(tab, lp, &config, &run);
         
         double tfinish = hpc_gettime();
         double elapsed = tfinish - tstart;
         
         // Output solution in the requested format
-        outputSolution(tab, lp, status, elapsed);
+        outputSolution(tab, lp, status, elapsed, &config, &run);
         
         // Cleanup
         freeTableau(tab);
@@ -423,7 +423,7 @@ int runApp(int argc, char* argv[]) {
     }
     
     // Final cleanup
-    if (g_iterLog) fclose(g_iterLog);
+    if (config.iterLog) fclose(config.iterLog);
     free((void*)inputFiles);
     
     return exitCode;
