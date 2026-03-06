@@ -1225,7 +1225,7 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
             rfc_artStart        = artStart;
 
             // Clamp negative RHS to zero (original behaviour, no Phase-2 perturbation).
-            for (int r = 0; r < nCons; r++) {
+            for (int r = 0; r < lp->numConstraints; r++) {
                 double* rp = &tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)];
                 if (*rp < 0.0) *rp = 0.0;
             }
