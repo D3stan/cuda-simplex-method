@@ -167,121 +167,325 @@ static void freeInputFiles(const char** files, int* owned, int count) {
     free((void*)files);
 }
 
+/* ---------------------------------------------------------------------------
+ * Argument parsing helpers
+ * --------------------------------------------------------------------------- */
+
+/* Return values for parseAppArgs */
+typedef enum {
+    PARSE_OK       = 0,  /* continue     */
+    PARSE_HELP     = 1,  /* print help and exit 0 */
+    PARSE_ERROR    = 2,  /* print error  and exit 1 */
+} ParseResult;
+
+/**
+ * Parse argv into config, flags, and inputFiles.
+ *
+ * inputFiles must be pre-allocated by the caller (at least argc entries).
+ * *inputCount is set to the number of non-flag arguments collected.
+ * *batchMode, *interactiveFlag, *logFile are set to the values parsed.
+ *
+ * Returns PARSE_OK, PARSE_HELP, or PARSE_ERROR.
+ */
+static ParseResult parseAppArgs(int argc, char* argv[],
+                                 SolverConfig* config,
+                                 int* batchMode, int* interactiveFlag,
+                                 const char** logFile,
+                                 const char** inputFiles, int* inputCount) {
+    *batchMode       = 0;
+    *interactiveFlag = 0;
+    *logFile         = NULL;
+    *inputCount      = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--silent") == 0) {
+            config->verbose = 0;
+        } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
+            config->debug = 1;
+        } else if (strcmp(argv[i], "--diag") == 0) {
+            config->verbose = 2;
+        } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) {
+            *interactiveFlag = 1;
+        } else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--max-iter") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --max-iter requires an integer argument\n");
+                return PARSE_ERROR;
+            }
+            config->maxIter = atoi(argv[++i]);
+            if (config->maxIter <= 0) {
+                fprintf(stderr, "Error: --max-iter must be positive\n");
+                return PARSE_ERROR;
+            }
+        } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--timeout") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --timeout requires a numeric argument\n");
+                return PARSE_ERROR;
+            }
+            config->timeout = atof(argv[++i]);
+            if (config->timeout < 0.0) {
+                fprintf(stderr, "Error: --timeout must be non-negative\n");
+                return PARSE_ERROR;
+            }
+        } else if (strcmp(argv[i], "--json") == 0) {
+            config->outputFormat = OUTPUT_JSON;
+        } else if (strcmp(argv[i], "--csv") == 0) {
+            config->outputFormat = OUTPUT_CSV;
+        } else if (strcmp(argv[i], "--batch") == 0) {
+            *batchMode = 1;
+        } else if (strcmp(argv[i], "--log") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --log requires a filename argument\n");
+                return PARSE_ERROR;
+            }
+            *logFile = argv[++i];
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            return PARSE_HELP;
+        } else if (argv[i][0] != '-') {
+            inputFiles[(*inputCount)++] = argv[i];
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK;
+}
+
+/**
+ * Expand a list of file/directory inputs for batch mode.
+ *
+ * Directories are scanned and each .mps/.dat file inside is appended.
+ * Plain files are passed through unchanged.
+ *
+ * Returns the expanded array (heap-allocated) and an equally-sized
+ * ownership-flag array (*out_owned), or NULL on allocation failure.
+ * *out_count receives the final count.
+ */
+static const char** expandBatchInputs(const char** inputFiles, int inputCount,
+                                       int** out_owned, int* out_count) {
+    const char** expanded = (const char**)malloc(MAX_BATCH_FILES * sizeof(const char*));
+    int*         owned    = (int*)calloc(MAX_BATCH_FILES, sizeof(int));
+    if (!expanded || !owned) {
+        free(expanded);
+        free(owned);
+        *out_owned = NULL;
+        *out_count = 0;
+        return NULL;
+    }
+
+    int count = 0;
+
+    for (int i = 0; i < inputCount; i++) {
+        struct stat st;
+        if (stat(inputFiles[i], &st) == 0 && S_ISDIR(st.st_mode)) {
+            DIR* dir = opendir(inputFiles[i]);
+            if (!dir) continue;
+            struct dirent* entry;
+            while ((entry = readdir(dir)) != NULL) {
+                if (!isSupportedInputFile(entry->d_name)) continue;
+                if (count >= MAX_BATCH_FILES) {
+                    fprintf(stderr,
+                            "Warning: batch file limit (%d) reached; skipping '%s/%s'.\n",
+                            MAX_BATCH_FILES, inputFiles[i], entry->d_name);
+                    continue;
+                }
+                size_t pathlen = strlen(inputFiles[i]) + 1 + strlen(entry->d_name) + 1;
+                char* fullpath = (char*)malloc(pathlen);
+                if (!fullpath) {
+                    fprintf(stderr, "Error: out of memory assembling path\n");
+                    closedir(dir);
+                    freeInputFiles(expanded, owned, count);
+                    *out_owned = NULL;
+                    *out_count = 0;
+                    return NULL;
+                }
+                snprintf(fullpath, pathlen, "%s/%s", inputFiles[i], entry->d_name);
+                owned[count] = 1;  /* heap-allocated: must be freed */
+                expanded[count++] = fullpath;
+            }
+            closedir(dir);
+        } else {
+            if (count < MAX_BATCH_FILES) {
+                expanded[count++] = inputFiles[i];
+            } else {
+                fprintf(stderr,
+                        "Warning: batch file limit (%d) reached; skipping '%s'.\n",
+                        MAX_BATCH_FILES, inputFiles[i]);
+            }
+        }
+    }
+
+    *out_owned = owned;
+    *out_count = count;
+    return expanded;
+}
+
+/**
+ * Solve all files in batch mode and print the summary.
+ * Suppresses per-problem output (unless verbose >= 2).
+ * Returns EXIT_SUCCESS always (individual failures are recorded in the summary).
+ */
+static int runBatchMode(const char** inputFiles, int inputCount,
+                         cudaDeviceProp* prop, SolverConfig* config, RunContext* run) {
+    int savedVerbose = config->verbose;
+    if (config->verbose < 2) config->verbose = 0;
+
+    BatchResult* results = (BatchResult*)malloc(inputCount * sizeof(BatchResult));
+    int resultCount = 0;
+
+    for (int f = 0; f < inputCount; f++) {
+        const char* base        = strrchr(inputFiles[f], '/');
+        const char* displayName = base ? base + 1 : inputFiles[f];
+
+        snprintf(results[resultCount].filename,
+                 sizeof(results[resultCount].filename), "%s", displayName);
+
+        LPProblem* lp = parseLP(inputFiles[f], config);
+        if (!lp) {
+            results[resultCount].numVars        = 0;
+            results[resultCount].numConstraints = 0;
+            results[resultCount].statusStr      = "PARSE_ERROR";
+            results[resultCount].objValue       = 0.0;
+            results[resultCount].iterations     = 0;
+            results[resultCount].elapsed        = 0.0;
+            resultCount++;
+            continue;
+        }
+
+        results[resultCount].numVars        = lp->numVars;
+        results[resultCount].numConstraints = lp->numConstraints;
+
+        preprocessBounds(lp, config);
+        Tableau* tab = createTableau(lp, config);
+
+        run->totalIterations = 0;
+        double tstart = hpc_gettime();
+        SimplexStatus status = solveSimplex(tab, lp, config, run);
+        double elapsed = hpc_gettime() - tstart;
+
+        results[resultCount].statusStr  = statusString(status);
+        results[resultCount].iterations = run->totalIterations;
+        results[resultCount].elapsed    = elapsed;
+
+        if (status == OPTIMAL) {
+            double* solution;
+            results[resultCount].objValue = extractSolutionValues(tab, lp, &solution);
+            free(solution);
+        } else {
+            results[resultCount].objValue = 0.0;
+        }
+
+        freeTableau(tab);
+        freeLPProblem(lp);
+        resultCount++;
+
+        /* Progress indicator: one line that is overwritten each iteration */
+        if (savedVerbose && config->outputFormat == OUTPUT_TEXT) {
+            fprintf(stderr, "\rSolved %d/%d problems...", resultCount, inputCount);
+            fflush(stderr);
+        }
+    }
+
+    /* Erase progress line (30 spaces covers the longest expected progress string) */
+    if (savedVerbose && config->outputFormat == OUTPUT_TEXT)
+        fprintf(stderr, "\r                              \r");
+
+    config->verbose = savedVerbose;
+
+    switch (config->outputFormat) {
+        case OUTPUT_JSON: printBatchSummaryJSON(results, resultCount); break;
+        case OUTPUT_CSV:  printBatchSummaryCSV(results, resultCount);  break;
+        default:          printBatchSummaryText(results, resultCount); break;
+    }
+
+    free(results);
+    return EXIT_SUCCESS;
+}
+
+/**
+ * Solve a single LP file (normal, non-batch mode).
+ * If no file is given, uses the built-in test problem.
+ */
+static int runSingleFileMode(const char** inputFiles, int inputCount,
+                              int argc, char* argv[],
+                              cudaDeviceProp* prop, SolverConfig* config, RunContext* run) {
+    LPProblem* lp = NULL;
+
+    if (inputCount > 0) {
+        if (config->verbose && config->outputFormat == OUTPUT_TEXT)
+            printf("Loading problem from: %s\n\n", inputFiles[0]);
+        lp = parseLP(inputFiles[0], config);
+        if (!lp) return EXIT_FAILURE;
+    } else {
+        if (config->outputFormat == OUTPUT_TEXT && config->verbose) {
+            printf("No input file provided. Using test problem.\n\n");
+            printf("Usage: %s [options] <problem.{mps,dat}>\n\n", argv[0]);
+        }
+        lp = createTestProblem();
+        if (config->verbose && config->outputFormat == OUTPUT_TEXT) {
+            printf("Test Problem:\n");
+            printf("  Maximize: 3*x1 + 2*x2\n");
+            printf("  Subject to:\n");
+            printf("    x1 + x2 <= 4\n");
+            printf("    2*x1 + x2 <= 6\n");
+            printf("  Expected: x1=2, x2=2, z=10\n");
+        }
+    }
+
+    preprocessBounds(lp, config);
+    Tableau* tab = createTableau(lp, config);
+
+    run->totalIterations = 0;
+    double tstart = hpc_gettime();
+    SimplexStatus status = solveSimplex(tab, lp, config, run);
+    double elapsed = hpc_gettime() - tstart;
+
+    outputSolution(tab, lp, status, elapsed, config, run);
+
+    freeTableau(tab);
+    freeLPProblem(lp);
+    return (status == OPTIMAL) ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
 int runApp(int argc, char* argv[]) {
     SolverConfig config = {1, OUTPUT_TEXT, NULL, 0, 50000, 0.0};
     RunContext run = {0, 0, 0.0};
 
-    // Parse flags
-    int batchMode = 0;
-    int interactiveFlag = 0;
-    const char* logFile = NULL;
-    int inputCount = 0;
-    const char** inputFiles = (const char**)malloc(argc * sizeof(const char*));
-    int* expandedOwned = NULL;  // parallel ownership flags for batch-expanded entries
-    
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--silent") == 0) {
-            config.verbose = 0;
-        } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
-            config.debug = 1;
-        } else if (strcmp(argv[i], "--diag") == 0) {
-            config.verbose = 2;
-        } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) {
-            interactiveFlag = 1;
-        } else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--max-iter") == 0) {
-            if (i + 1 < argc) {
-                config.maxIter = atoi(argv[++i]);
-                if (config.maxIter <= 0) { fprintf(stderr, "Error: --max-iter must be positive\n"); freeInputFiles(inputFiles, expandedOwned, inputCount); return EXIT_FAILURE; }
-            } else {
-                fprintf(stderr, "Error: --max-iter requires an integer argument\n");
-                freeInputFiles(inputFiles, expandedOwned, inputCount); return EXIT_FAILURE;
-            }
-        } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--timeout") == 0) {
-            if (i + 1 < argc) {
-                config.timeout = atof(argv[++i]);
-                if (config.timeout < 0.0) { fprintf(stderr, "Error: --timeout must be non-negative\n"); freeInputFiles(inputFiles, expandedOwned, inputCount); return EXIT_FAILURE; }
-            } else {
-                fprintf(stderr, "Error: --timeout requires a numeric argument\n");
-                freeInputFiles(inputFiles, expandedOwned, inputCount); return EXIT_FAILURE;
-            }
-        } else if (strcmp(argv[i], "--json") == 0) {
-            config.outputFormat = OUTPUT_JSON;
-        } else if (strcmp(argv[i], "--csv") == 0) {
-            config.outputFormat = OUTPUT_CSV;
-        } else if (strcmp(argv[i], "--batch") == 0) {
-            batchMode = 1;
-        } else if (strcmp(argv[i], "--log") == 0) {
-            if (i + 1 < argc) {
-                logFile = argv[++i];
-            } else {
-                fprintf(stderr, "Error: --log requires a filename argument\n");
-                freeInputFiles(inputFiles, expandedOwned, inputCount);
-                return EXIT_FAILURE;
-            }
-        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            printUsage(argv[0]);
-            freeInputFiles(inputFiles, expandedOwned, inputCount);
-            return EXIT_SUCCESS;
-        } else if (argv[i][0] != '-') {
-            inputFiles[inputCount++] = argv[i];
-        } else {
-            fprintf(stderr, "Unknown option: %s\n", argv[i]);
-            printUsage(argv[0]);
-            freeInputFiles(inputFiles, expandedOwned, inputCount);
-            return EXIT_FAILURE;
-        }
+    int         batchMode      = 0;
+    int         interactiveFlag = 0;
+    const char* logFile        = NULL;
+    int         inputCount     = 0;
+    const char** inputFiles    = (const char**)malloc(argc * sizeof(const char*));
+    int*        expandedOwned  = NULL;
+
+    ParseResult pr = parseAppArgs(argc, argv, &config,
+                                  &batchMode, &interactiveFlag, &logFile,
+                                  inputFiles, &inputCount);
+    if (pr == PARSE_HELP) {
+        printUsage(argv[0]);
+        free(inputFiles);
+        return EXIT_SUCCESS;
     }
-    
-    // In batch mode, auto-expand directory arguments into .mps/.dat files
+    if (pr == PARSE_ERROR) {
+        printUsage(argv[0]);
+        free(inputFiles);
+        return EXIT_FAILURE;
+    }
+
+    /* Batch mode: expand directory arguments */
     if (batchMode) {
         int expandedCount = 0;
-        const char** expandedFiles = (const char**)malloc(MAX_BATCH_FILES * sizeof(const char*));
-        expandedOwned = (int*)calloc(MAX_BATCH_FILES, sizeof(int));
-        
-        for (int i = 0; i < inputCount; i++) {
-            struct stat st;
-            if (stat(inputFiles[i], &st) == 0 && S_ISDIR(st.st_mode)) {
-                DIR* dir = opendir(inputFiles[i]);
-                if (dir) {
-                    struct dirent* entry;
-                    while ((entry = readdir(dir)) != NULL) {
-                        if (isSupportedInputFile(entry->d_name)) {
-                            if (expandedCount >= MAX_BATCH_FILES) {
-                                fprintf(stderr, "Warning: batch file limit (%d) reached; skipping '%s/%s'.\n",
-                                        MAX_BATCH_FILES, inputFiles[i], entry->d_name);
-                                continue;
-                            }
-                            size_t pathlen = strlen(inputFiles[i]) + 1 + strlen(entry->d_name) + 1;
-                            char* fullpath = (char*)malloc(pathlen);
-                            if (!fullpath) {
-                                fprintf(stderr, "Error: out of memory assembling path\n");
-                                closedir(dir);
-                                freeInputFiles(expandedFiles, expandedOwned, expandedCount);
-                                freeInputFiles(inputFiles, NULL, 0);
-                                return EXIT_FAILURE;
-                            }
-                            snprintf(fullpath, pathlen, "%s/%s", inputFiles[i], entry->d_name);
-                            expandedOwned[expandedCount] = 1;   // this entry is heap-allocated
-                            expandedFiles[expandedCount++] = fullpath;
-                        }
-                    }
-                    closedir(dir);
-                }
-            } else {
-                if (expandedCount < MAX_BATCH_FILES)
-                    expandedFiles[expandedCount++] = inputFiles[i];
-                else
-                    fprintf(stderr, "Warning: batch file limit (%d) reached; skipping '%s'.\n",
-                            MAX_BATCH_FILES, inputFiles[i]);
-            }
+        const char** expandedFiles = expandBatchInputs(inputFiles, inputCount,
+                                                        &expandedOwned, &expandedCount);
+        if (!expandedFiles) {
+            free(inputFiles);
+            return EXIT_FAILURE;
         }
-        
         free(inputFiles);
         inputFiles = expandedFiles;
         inputCount = expandedCount;
     }
-    
-    // Open iteration log if requested
+
+    /* Open iteration log if requested */
     if (logFile) {
         config.iterLog = fopen(logFile, "w");
         if (!config.iterLog) {
@@ -291,13 +495,13 @@ int runApp(int argc, char* argv[]) {
         }
         fprintf(config.iterLog, "iter,phase,pivot_col,pivot_row,reduced_cost,ratio,obj_rhs\n");
     }
-    
+
     if (config.verbose && config.outputFormat == OUTPUT_TEXT) {
         printf("CUDA Two-Phase Simplex Solver\n");
         printf("=============================\n\n");
     }
-    
-    // Check CUDA device
+
+    /* Check CUDA device */
     int deviceCount;
     CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
     if (deviceCount == 0) {
@@ -306,168 +510,25 @@ int runApp(int argc, char* argv[]) {
         freeInputFiles(inputFiles, expandedOwned, inputCount);
         return EXIT_FAILURE;
     }
-    
+
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     if (config.verbose && config.outputFormat == OUTPUT_TEXT) {
         printf("Using CUDA device: %s\n", prop.name);
         printf("Compute capability: %d.%d\n\n", prop.major, prop.minor);
     }
-    
+
     int exitCode = EXIT_SUCCESS;
-    
-    // ===== INTERACTIVE MODE =====
+
     if (interactiveFlag) {
         interactiveMode(&prop, &config, &run);
-        if (config.iterLog) fclose(config.iterLog);
-        freeInputFiles(inputFiles, expandedOwned, inputCount);
-        return EXIT_SUCCESS;
-    }
-    
-    if (batchMode && inputCount > 0) {
-        // ===== BATCH MODE =====
-        int savedVerbose = config.verbose;
-        if (config.verbose < 2) config.verbose = 0;  // Silence per-problem output unless -d
-        
-        BatchResult* results = (BatchResult*)malloc(inputCount * sizeof(BatchResult));
-        int resultCount = 0;
-        
-        for (int f = 0; f < inputCount; f++) {
-            // Extract base filename for display
-            const char* base = strrchr(inputFiles[f], '/');
-            const char* displayName = base ? base + 1 : inputFiles[f];
-            
-            LPProblem* lp = parseLP(inputFiles[f], &config);
-            if (!lp) {
-                snprintf(results[resultCount].filename, sizeof(results[resultCount].filename),
-                         "%s", displayName);
-                results[resultCount].numVars = 0;
-                results[resultCount].numConstraints = 0;
-                results[resultCount].statusStr = "PARSE_ERROR";
-                results[resultCount].objValue = 0.0;
-                results[resultCount].iterations = 0;
-                results[resultCount].elapsed = 0.0;
-                resultCount++;
-                continue;
-            }
-            
-            snprintf(results[resultCount].filename, sizeof(results[resultCount].filename),
-                     "%s", displayName);
-            results[resultCount].numVars = lp->numVars;
-            results[resultCount].numConstraints = lp->numConstraints;
-            
-            preprocessBounds(lp, &config);
-            Tableau* tab = createTableau(lp, &config);
-            
-            run.totalIterations = 0;
-            
-            double tstart = hpc_gettime();
-            SimplexStatus status = solveSimplex(tab, lp, &config, &run);
-            double elapsed = hpc_gettime() - tstart;
-            
-            results[resultCount].statusStr = statusString(status);
-            results[resultCount].iterations = run.totalIterations;
-            results[resultCount].elapsed = elapsed;
-            
-            if (status == OPTIMAL) {
-                double* solution;
-                results[resultCount].objValue = extractSolutionValues(tab, lp, &solution);
-                free(solution);
-            } else {
-                results[resultCount].objValue = 0.0;
-            }
-            
-            freeTableau(tab);
-            freeLPProblem(lp);
-            resultCount++;
-            
-            if (savedVerbose && config.outputFormat == OUTPUT_TEXT) {
-                fprintf(stderr, "\rSolved %d/%d problems...", resultCount, inputCount);
-                fflush(stderr);
-            }
-        }
-        
-        if (savedVerbose && config.outputFormat == OUTPUT_TEXT)
-            fprintf(stderr, "\r                              \r");
-        
-        config.verbose = savedVerbose;
-        
-        // Print batch summary
-        switch (config.outputFormat) {
-            case OUTPUT_JSON:
-                printBatchSummaryJSON(results, resultCount);
-                break;
-            case OUTPUT_CSV:
-                printBatchSummaryCSV(results, resultCount);
-                break;
-            case OUTPUT_TEXT:
-            default:
-                printBatchSummaryText(results, resultCount);
-                break;
-        }
-        
-        free(results);
-        
+    } else if (batchMode && inputCount > 0) {
+        exitCode = runBatchMode(inputFiles, inputCount, &prop, &config, &run);
     } else {
-        // ===== SINGLE FILE MODE =====
-        LPProblem* lp = NULL;
-        
-        if (inputCount > 0) {
-            if (config.verbose && config.outputFormat == OUTPUT_TEXT)
-                printf("Loading problem from: %s\n\n", inputFiles[0]);
-            lp = parseLP(inputFiles[0], &config);
-            if (!lp) {
-                if (config.iterLog) fclose(config.iterLog);
-                freeInputFiles(inputFiles, expandedOwned, inputCount);
-                return EXIT_FAILURE;
-            }
-        } else {
-            if (config.outputFormat == OUTPUT_TEXT && config.verbose) {
-                printf("No input file provided. Using test problem.\n\n");
-                printf("Usage: %s [options] <problem.{mps,dat}>\n\n", argv[0]);
-            }
-            lp = createTestProblem();
-            
-            if (config.verbose && config.outputFormat == OUTPUT_TEXT) {
-                printf("Test Problem:\n");
-                printf("  Maximize: 3*x1 + 2*x2\n");
-                printf("  Subject to:\n");
-                printf("    x1 + x2 <= 4\n");
-                printf("    2*x1 + x2 <= 6\n");
-                printf("  Expected: x1=2, x2=2, z=10\n");
-            }
-        }
-        
-        // Preprocess variable bounds and range constraints
-        preprocessBounds(lp, &config);
-        
-        // Create tableau
-        Tableau* tab = createTableau(lp, &config);
-        
-        run.totalIterations = 0;
-        
-        // Time only the computation (solving), not I/O
-        double tstart = hpc_gettime();
-        
-        // Solve
-        SimplexStatus status = solveSimplex(tab, lp, &config, &run);
-        
-        double tfinish = hpc_gettime();
-        double elapsed = tfinish - tstart;
-        
-        // Output solution in the requested format
-        outputSolution(tab, lp, status, elapsed, &config, &run);
-        
-        // Cleanup
-        freeTableau(tab);
-        freeLPProblem(lp);
-        
-        exitCode = (status == OPTIMAL) ? EXIT_SUCCESS : EXIT_FAILURE;
+        exitCode = runSingleFileMode(inputFiles, inputCount, argc, argv, &prop, &config, &run);
     }
-    
-    // Final cleanup
+
     if (config.iterLog) fclose(config.iterLog);
     freeInputFiles(inputFiles, expandedOwned, inputCount);
-    
     return exitCode;
 }

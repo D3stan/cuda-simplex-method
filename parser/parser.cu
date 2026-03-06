@@ -236,10 +236,435 @@ typedef enum {
     SEC_UNKNOWN   /* unrecognised section — data lines are silently skipped */
 } MpsSection;
 
+/* Internal parse name type */
+typedef struct { char name[64]; } VarName;
+
+/* Sparse coefficient entry accumulated during COLUMNS parsing */
+typedef struct { int row; int col; double value; } CoeffEntry;
+
+/**
+ * All mutable state accumulated while parsing an MPS file.
+ * Passed by pointer to every section-parsing helper so they share
+ * the same dynamic arrays without C++ lambda captures.
+ */
+typedef struct {
+    /* Row data */
+    int           rowCap;
+    int           numRows;
+    char**        rowNames;
+    ConstraintType* rowTypes;
+    double*       rhsValues;
+    double*       rangeVals;
+    char*         objRowName;
+
+    /* Variable data */
+    int           varCap;
+    int           numVars;
+    VarName*      varNamesBuf;
+    double*       objCoeffsTemp;
+    double*       loBounds;
+    double*       upBounds;
+    int*          isInt;
+
+    /* Sparse coefficients */
+    int           coeffCap;
+    int           numCoeffs;
+    CoeffEntry*   coeffs;
+
+    /* COLUMNS state */
+    int           inIntegerBlock;
+} MpsParseState;
+
+/* ---------------------------------------------------------------------------
+ * Dynamic-array growth helpers
+ * Both return 1 on success, 0 if any realloc fails (leaving state unchanged).
+ * --------------------------------------------------------------------------- */
+
+static int mpsGrowVarArrays(MpsParseState* s) {
+    int oldCap = s->varCap;
+    int newCap = oldCap * 2;
+
+    VarName* t1 = (VarName*)realloc(s->varNamesBuf,   newCap * sizeof(VarName));
+    if (!t1) return 0;
+    s->varNamesBuf = t1;
+
+    double* t2 = (double*)realloc(s->objCoeffsTemp, newCap * sizeof(double));
+    if (!t2) return 0;
+    s->objCoeffsTemp = t2;
+
+    double* t3 = (double*)realloc(s->loBounds, newCap * sizeof(double));
+    if (!t3) return 0;
+    s->loBounds = t3;
+
+    double* t4 = (double*)realloc(s->upBounds, newCap * sizeof(double));
+    if (!t4) return 0;
+    s->upBounds = t4;
+
+    int* t5 = (int*)realloc(s->isInt, newCap * sizeof(int));
+    if (!t5) return 0;
+    s->isInt = t5;
+
+    for (int i = oldCap; i < newCap; i++) {
+        s->objCoeffsTemp[i] = 0.0;
+        s->loBounds[i]      = 0.0;
+        s->upBounds[i]      = DBL_MAX;
+        s->isInt[i]         = 0;
+    }
+    s->varCap = newCap;
+    return 1;
+}
+
+static int mpsGrowRowArrays(MpsParseState* s) {
+    int oldCap = s->rowCap;
+    int newCap = oldCap * 2;
+
+    char** t1 = (char**)realloc(s->rowNames, newCap * sizeof(char*));
+    if (!t1) return 0;
+    s->rowNames = t1;
+
+    ConstraintType* t2 = (ConstraintType*)realloc(s->rowTypes, newCap * sizeof(ConstraintType));
+    if (!t2) return 0;
+    s->rowTypes = t2;
+
+    double* t3 = (double*)realloc(s->rhsValues, newCap * sizeof(double));
+    if (!t3) return 0;
+    s->rhsValues = t3;
+
+    double* t4 = (double*)realloc(s->rangeVals, newCap * sizeof(double));
+    if (!t4) return 0;
+    s->rangeVals = t4;
+
+    for (int i = oldCap; i < newCap; i++) {
+        s->rhsValues[i] = 0.0;
+        s->rangeVals[i] = 0.0;
+    }
+    s->rowCap = newCap;
+    return 1;
+}
+
+/* ---------------------------------------------------------------------------
+ * Name lookup / insertion helpers
+ * --------------------------------------------------------------------------- */
+
+/* Find variable index by name; returns -1 if not found. */
+static int mpsFindVar(const MpsParseState* s, const char* name) {
+    for (int i = 0; i < s->numVars; i++) {
+        if (strcmp(s->varNamesBuf[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+/* Add a new variable; returns its index, or -1 on allocation failure. */
+static int mpsAddVar(MpsParseState* s, const char* name) {
+    if (s->numVars >= s->varCap && !mpsGrowVarArrays(s)) return -1;
+    strncpy(s->varNamesBuf[s->numVars].name, name, 63);
+    s->varNamesBuf[s->numVars].name[63] = '\0';
+    s->objCoeffsTemp[s->numVars] = 0.0;
+    s->loBounds[s->numVars]      = 0.0;
+    s->upBounds[s->numVars]      = DBL_MAX;
+    s->isInt[s->numVars]         = s->inIntegerBlock ? 1 : 0;
+    return s->numVars++;
+}
+
+/* Find row index; returns -1 if it names the objective row, -2 if not found. */
+static int mpsFindRow(const MpsParseState* s, const char* name) {
+    if (s->objRowName && strcmp(name, s->objRowName) == 0) return -1;
+    for (int i = 0; i < s->numRows; i++) {
+        if (strcmp(s->rowNames[i], name) == 0) return i;
+    }
+    return -2;
+}
+
+/* Append a sparse coefficient entry; returns 1 on success, 0 on realloc failure. */
+static int mpsAddCoeff(MpsParseState* s, int row, int col, double val) {
+    if (s->numCoeffs >= s->coeffCap) {
+        int newCap = s->coeffCap * 2;
+        CoeffEntry* tmp = (CoeffEntry*)realloc(s->coeffs, newCap * sizeof(CoeffEntry));
+        if (!tmp) return 0;
+        s->coeffs    = tmp;
+        s->coeffCap  = newCap;
+    }
+    s->coeffs[s->numCoeffs].row   = row;
+    s->coeffs[s->numCoeffs].col   = col;
+    s->coeffs[s->numCoeffs].value = val;
+    s->numCoeffs++;
+    return 1;
+}
+
+/* ---------------------------------------------------------------------------
+ * Per-section data-line parsers
+ * Each returns 1 to continue, 0 to signal a fatal allocation failure.
+ * --------------------------------------------------------------------------- */
+
+static int parseRowsLine(const char* line, MpsParseState* s) {
+    char typeField[4], nameField[64];
+    extractMPSField(line, MPS_F1_START, MPS_F1_END, typeField, sizeof(typeField));
+    extractMPSField(line, MPS_F2_START, MPS_F2_END, nameField, sizeof(nameField));
+
+    if (nameField[0] == '\0') return 1;
+
+    char type = typeField[0];
+    if (type == 'N') {
+        /* Only the first N row is the objective (MPS convention). */
+        if (!s->objRowName) {
+            s->objRowName = strdup(nameField);
+            if (!s->objRowName) return 0;
+        } else {
+            fprintf(stderr, "Warning: Multiple N rows found. "
+                    "Using '%s' as objective, ignoring '%s'.\n",
+                    s->objRowName, nameField);
+        }
+    } else {
+        if (s->numRows >= s->rowCap && !mpsGrowRowArrays(s)) return 0;
+        s->rowNames[s->numRows] = strdup(nameField);
+        if (!s->rowNames[s->numRows]) return 0;
+        switch (type) {
+            case 'L': s->rowTypes[s->numRows] = CONSTRAINT_LE; break;
+            case 'G': s->rowTypes[s->numRows] = CONSTRAINT_GE; break;
+            case 'E': s->rowTypes[s->numRows] = CONSTRAINT_EQ; break;
+            default:
+                fprintf(stderr, "Warning: Unknown row type '%c' for '%s', "
+                        "defaulting to EQ.\n", type, nameField);
+                s->rowTypes[s->numRows] = CONSTRAINT_EQ;
+        }
+        s->numRows++;
+    }
+    return 1;
+}
+
+static int parseColumnsLine(const char* line, MpsParseState* s) {
+    char field2[64], field3[64], field4[64], field5[64], field6[64];
+    extractMPSField(line, MPS_F2_START, MPS_F2_END, field2, sizeof(field2));  /* column name  */
+    extractMPSField(line, MPS_F3_START, MPS_F3_END, field3, sizeof(field3));  /* row name 1   */
+    extractMPSField(line, MPS_F4_START, MPS_F4_END, field4, sizeof(field4));  /* value 1      */
+    extractMPSField(line, MPS_F5_START, MPS_F5_END, field5, sizeof(field5));  /* row name 2   */
+    extractMPSField(line, MPS_F6_START, MPS_F6_END, field6, sizeof(field6));  /* value 2      */
+
+    if (field2[0] == '\0') return 1;
+
+    /* Integer MARKER lines — update INTORG/INTEND state and skip. */
+    if (strcmp(field3, "'MARKER'") == 0 || strcmp(field3, "MARKER") == 0) {
+        if (strstr(field4, "INTORG") || strstr(field5, "INTORG") ||
+            strstr(field4, "'INTORG'") || strstr(field5, "'INTORG'")) {
+            s->inIntegerBlock = 1;
+        } else if (strstr(field4, "INTEND") || strstr(field5, "INTEND") ||
+                   strstr(field4, "'INTEND'") || strstr(field5, "'INTEND'")) {
+            s->inIntegerBlock = 0;
+        }
+        return 1;
+    }
+
+    double val1;
+    if (!parseMPSDouble(field4, &val1)) return 1;
+
+    int varIdx = mpsFindVar(s, field2);
+    if (varIdx < 0) {
+        varIdx = mpsAddVar(s, field2);
+        if (varIdx < 0) return 0;
+    }
+
+    /* First (row, value) pair */
+    int rowIdx = mpsFindRow(s, field3);
+    if (rowIdx == -1) {
+        s->objCoeffsTemp[varIdx] = val1;
+    } else if (rowIdx >= 0) {
+        if (!mpsAddCoeff(s, rowIdx, varIdx, val1)) return 0;
+    }
+
+    /* Second (row, value) pair — optional */
+    double val2;
+    if (field5[0] != '\0' && parseMPSDouble(field6, &val2)) {
+        rowIdx = mpsFindRow(s, field5);
+        if (rowIdx == -1) {
+            s->objCoeffsTemp[varIdx] = val2;
+        } else if (rowIdx >= 0) {
+            if (!mpsAddCoeff(s, rowIdx, varIdx, val2)) return 0;
+        }
+    }
+    return 1;
+}
+
+static void parseRhsLine(const char* line, MpsParseState* s, LPProblem* lp) {
+    char field2[64], field3[64], field4[64], field5[64], field6[64];
+    extractMPSField(line, MPS_F2_START, MPS_F2_END, field2, sizeof(field2));
+    extractMPSField(line, MPS_F3_START, MPS_F3_END, field3, sizeof(field3));
+    extractMPSField(line, MPS_F4_START, MPS_F4_END, field4, sizeof(field4));
+    extractMPSField(line, MPS_F5_START, MPS_F5_END, field5, sizeof(field5));
+    extractMPSField(line, MPS_F6_START, MPS_F6_END, field6, sizeof(field6));
+
+    double val1;
+    if (field3[0] != '\0' && parseMPSDouble(field4, &val1)) {
+        int rowIdx = mpsFindRow(s, field3);
+        if (rowIdx >= 0)       s->rhsValues[rowIdx] = val1;
+        else if (rowIdx == -1) lp->objConstant = val1;  /* N-row RHS = objective constant */
+    }
+
+    double val2;
+    if (field5[0] != '\0' && parseMPSDouble(field6, &val2)) {
+        int rowIdx = mpsFindRow(s, field5);
+        if (rowIdx >= 0)       s->rhsValues[rowIdx] = val2;
+        else if (rowIdx == -1) lp->objConstant = val2;
+    }
+}
+
+static void parseBoundsLine(const char* line, MpsParseState* s) {
+    /* Field 1 (cols 1-2):  bound type  (LO, UP, FX, FR, MI, PL, BV, LI, UI)
+     * Field 2 (cols 4-11): bound set name (ignored — only one bound set supported)
+     * Field 3 (cols 14-21): variable name
+     * Field 4 (cols 24-35): value (absent for FR, MI, PL, BV) */
+    char typeField[4], field2[64], field3[64], field4[64];
+    extractMPSField(line, MPS_F1_START, MPS_F1_END, typeField, sizeof(typeField));
+    extractMPSField(line, MPS_F2_START, MPS_F2_END, field2,    sizeof(field2));
+    extractMPSField(line, MPS_F3_START, MPS_F3_END, field3,    sizeof(field3));
+    extractMPSField(line, MPS_F4_START, MPS_F4_END, field4,    sizeof(field4));
+
+    if (field3[0] == '\0') return;
+
+    int varIdx = mpsFindVar(s, field3);
+    if (varIdx < 0) {
+        fprintf(stderr, "Warning: BOUNDS references unknown variable '%s'.\n", field3);
+        return;
+    }
+
+    double val = 0.0;
+    int hasValue = parseMPSDouble(field4, &val);
+
+    if      (strcmp(typeField, "LO") == 0 && hasValue) { s->loBounds[varIdx] = val; }
+    else if (strcmp(typeField, "UP") == 0 && hasValue) { s->upBounds[varIdx] = val; }
+    else if (strcmp(typeField, "FX") == 0 && hasValue) { s->loBounds[varIdx] = val; s->upBounds[varIdx] = val; }
+    else if (strcmp(typeField, "FR") == 0)             { s->loBounds[varIdx] = -DBL_MAX; s->upBounds[varIdx] = DBL_MAX; }
+    else if (strcmp(typeField, "MI") == 0)             { s->loBounds[varIdx] = -DBL_MAX; }
+    else if (strcmp(typeField, "PL") == 0)             { s->upBounds[varIdx] =  DBL_MAX; }
+    else if (strcmp(typeField, "BV") == 0)             { s->loBounds[varIdx] = 0.0; s->upBounds[varIdx] = 1.0; s->isInt[varIdx] = 1; }
+    else if (strcmp(typeField, "LI") == 0 && hasValue) { s->loBounds[varIdx] = val; s->isInt[varIdx] = 1; }
+    else if (strcmp(typeField, "UI") == 0 && hasValue) { s->upBounds[varIdx] = val; s->isInt[varIdx] = 1; }
+    else {
+        fprintf(stderr, "Warning: Unknown/invalid bound type '%s' for variable '%s'.\n",
+                typeField, field3);
+    }
+}
+
+static void parseRangesLine(const char* line, MpsParseState* s) {
+    /* Same field layout as RHS: set-name, row, value [, row, value] */
+    char field2[64], field3[64], field4[64], field5[64], field6[64];
+    extractMPSField(line, MPS_F2_START, MPS_F2_END, field2, sizeof(field2));
+    extractMPSField(line, MPS_F3_START, MPS_F3_END, field3, sizeof(field3));
+    extractMPSField(line, MPS_F4_START, MPS_F4_END, field4, sizeof(field4));
+    extractMPSField(line, MPS_F5_START, MPS_F5_END, field5, sizeof(field5));
+    extractMPSField(line, MPS_F6_START, MPS_F6_END, field6, sizeof(field6));
+
+    double val1;
+    if (field3[0] != '\0' && parseMPSDouble(field4, &val1)) {
+        int rowIdx = mpsFindRow(s, field3);
+        if (rowIdx >= 0) s->rangeVals[rowIdx] = val1;
+    }
+
+    double val2;
+    if (field5[0] != '\0' && parseMPSDouble(field6, &val2)) {
+        int rowIdx = mpsFindRow(s, field5);
+        if (rowIdx >= 0) s->rangeVals[rowIdx] = val2;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Struct assembly: converts accumulated parse state into a fully allocated
+ * LPProblem.  Returns 1 on success, 0 on allocation failure (lp partially
+ * allocated; the caller should invoke freeLPProblem + freeParseState).
+ * --------------------------------------------------------------------------- */
+
+static int buildLPProblem(LPProblem* lp, MpsParseState* s) {
+    int numVars = s->numVars;
+    int numRows = s->numRows;
+
+    lp->numVars        = numVars;
+    lp->numConstraints = numRows;
+
+    /* All pointer arrays use calloc so uninitialized entries are NULL,
+     * keeping freeLPProblem safe when called from an error path. */
+    lp->objCoeffs = (double*)malloc(numVars * sizeof(double));
+    if (!lp->objCoeffs) return 0;
+    memcpy(lp->objCoeffs, s->objCoeffsTemp, numVars * sizeof(double));
+
+    lp->lowerBounds = (double*)malloc(numVars * sizeof(double));
+    if (!lp->lowerBounds) return 0;
+    memcpy(lp->lowerBounds, s->loBounds, numVars * sizeof(double));
+
+    lp->upperBounds = (double*)malloc(numVars * sizeof(double));
+    if (!lp->upperBounds) return 0;
+    memcpy(lp->upperBounds, s->upBounds, numVars * sizeof(double));
+
+    lp->isInteger = (int*)malloc(numVars * sizeof(int));
+    if (!lp->isInteger) return 0;
+    memcpy(lp->isInteger, s->isInt, numVars * sizeof(int));
+
+    lp->rhs = (double*)malloc(numRows * sizeof(double));
+    if (!lp->rhs) return 0;
+
+    lp->constraintTypes = (ConstraintType*)malloc(numRows * sizeof(ConstraintType));
+    if (!lp->constraintTypes) return 0;
+
+    lp->constraintMatrix = (double**)calloc(numRows, sizeof(double*));
+    if (!lp->constraintMatrix) return 0;
+
+    lp->varNames = (char**)calloc(numVars, sizeof(char*));
+    if (!lp->varNames) return 0;
+
+    lp->constraintNames = (char**)calloc(numRows, sizeof(char*));
+    if (!lp->constraintNames) return 0;
+
+    lp->rangeValues = (double*)malloc(numRows * sizeof(double));
+    if (!lp->rangeValues) return 0;
+
+    for (int i = 0; i < numRows; i++) {
+        lp->constraintMatrix[i] = (double*)calloc(numVars, sizeof(double));
+        if (!lp->constraintMatrix[i]) return 0;
+        lp->rhs[i]              = s->rhsValues[i];
+        lp->constraintTypes[i]  = s->rowTypes[i];
+        lp->constraintNames[i]  = s->rowNames[i];  /* Transfer ownership */
+        lp->rangeValues[i]      = s->rangeVals[i];
+    }
+
+    for (int i = 0; i < numVars; i++) {
+        lp->varNames[i] = strdup(s->varNamesBuf[i].name);
+        if (!lp->varNames[i]) return 0;
+    }
+
+    /* Scatter sparse coefficients into the dense constraint matrix */
+    for (int i = 0; i < s->numCoeffs; i++) {
+        lp->constraintMatrix[s->coeffs[i].row][s->coeffs[i].col] = s->coeffs[i].value;
+    }
+    return 1;
+}
+
+/* Release all temporary buffers owned by the parse state.
+ * Row-name pointers already transferred to lp->constraintNames are NOT freed
+ * here; callers must pass the number of rows transferred so remaining ones
+ * (not yet in lp) can still be freed. */
+static void freeParseState(MpsParseState* s, int rowsTransferred) {
+    free(s->rangeVals);
+    free(s->rhsValues);
+    free(s->coeffs);
+    free(s->isInt);
+    free(s->upBounds);
+    free(s->loBounds);
+    free(s->objCoeffsTemp);
+    free(s->varNamesBuf);
+    free(s->rowTypes);
+    /* Free row-name strings not yet owned by lp->constraintNames */
+    for (int i = rowsTransferred; i < s->numRows; i++) free(s->rowNames[i]);
+    free(s->rowNames);
+    free(s->objRowName);
+}
+
 /**
  * Parse an MPS file into an LPProblem.
  *
  * Single-pass, fixed-column format, dynamic allocation.
+ * Responsibilities:
+ *   1. File I/O  — open, read line-by-line, close
+ *   2. Section dispatch  — route each data line to the appropriate parser
+ *   3. Struct assembly  — delegate to buildLPProblem after the loop
+ *
  * Handles: ROWS, COLUMNS, RHS, BOUNDS, RANGES, OBJSENSE, integer MARKERs.
  * Stops strictly at ENDATA.
  */
@@ -249,457 +674,96 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
         fprintf(stderr, "Error: Cannot open file %s\n", filename);
         return NULL;
     }
-    
+
     LPProblem* lp = (LPProblem*)calloc(1, sizeof(LPProblem));
-    lp->sense = MINIMIZE;
+    lp->sense      = MINIMIZE;
     lp->objConstant = 0.0;
-    
+
     char rawLine[MPS_LINE_BUF_SIZE];
     MpsSection section = SEC_NONE;
-    
-    // --- Dynamic storage for rows ---
-    int rowCap = MPS_INIT_ROW_CAP;
-    int numRows = 0;
-    char** rowNames = (char**)malloc(rowCap * sizeof(char*));
-    ConstraintType* rowTypes = (ConstraintType*)malloc(rowCap * sizeof(ConstraintType));
-    double* rhsValues = (double*)calloc(rowCap, sizeof(double));
-    double* rangeVals = (double*)calloc(rowCap, sizeof(double));
-    char* objRowName = NULL;
-    
-    // --- Dynamic storage for variables ---
-    int varCap = MPS_INIT_VAR_CAP;
-    int numVars = 0;
-    typedef struct { char name[64]; } VarName;
-    VarName* varNamesBuf = (VarName*)malloc(varCap * sizeof(VarName));
-    double* objCoeffsTemp = (double*)calloc(varCap, sizeof(double));
-    double* loBounds = (double*)calloc(varCap, sizeof(double));   // default 0
-    double* upBounds = (double*)malloc(varCap * sizeof(double));
-    int* isInt = (int*)calloc(varCap, sizeof(int));
-    for (int i = 0; i < varCap; i++) upBounds[i] = DBL_MAX;
-    
-    // --- Dynamic storage for sparse coefficients ---
-    int coeffCap = MPS_INIT_COEFF_CAP;
-    int numCoeffs = 0;
-    typedef struct { int row; int col; double value; } CoeffEntry;
-    CoeffEntry* coeffs = (CoeffEntry*)malloc(coeffCap * sizeof(CoeffEntry));
-    
-    // Integer marker state for COLUMNS section
-    int inIntegerBlock = 0;
-    
-    // --- Helper: grow variable arrays when capacity is exceeded ---
-    // Returns 1 on success, 0 if any realloc fails (original pointers remain valid at oldCap).
-    auto growVarArrays = [&]() -> int {
-        int oldCap = varCap;
-        varCap *= 2;
-        VarName* t1 = (VarName*)realloc(varNamesBuf,   varCap * sizeof(VarName));
-        if (!t1) { varCap = oldCap; return 0; }
-        varNamesBuf = t1;
-        double* t2 = (double*)realloc(objCoeffsTemp, varCap * sizeof(double));
-        if (!t2) { varCap = oldCap; return 0; }
-        objCoeffsTemp = t2;
-        double* t3 = (double*)realloc(loBounds, varCap * sizeof(double));
-        if (!t3) { varCap = oldCap; return 0; }
-        loBounds = t3;
-        double* t4 = (double*)realloc(upBounds, varCap * sizeof(double));
-        if (!t4) { varCap = oldCap; return 0; }
-        upBounds = t4;
-        int* t5 = (int*)realloc(isInt, varCap * sizeof(int));
-        if (!t5) { varCap = oldCap; return 0; }
-        isInt = t5;
-        for (int i = oldCap; i < varCap; i++) {
-            objCoeffsTemp[i] = 0.0;
-            loBounds[i] = 0.0;
-            upBounds[i] = DBL_MAX;
-            isInt[i] = 0;
-        }
-        return 1;
-    };
-    
-    // --- Helper: grow row arrays when capacity is exceeded ---
-    // Returns 1 on success, 0 if any realloc fails (original pointers remain valid at oldCap).
-    auto growRowArrays = [&]() -> int {
-        int oldCap = rowCap;
-        rowCap *= 2;
-        char** t1 = (char**)realloc(rowNames, rowCap * sizeof(char*));
-        if (!t1) { rowCap = oldCap; return 0; }
-        rowNames = t1;
-        ConstraintType* t2 = (ConstraintType*)realloc(rowTypes, rowCap * sizeof(ConstraintType));
-        if (!t2) { rowCap = oldCap; return 0; }
-        rowTypes = t2;
-        double* t3 = (double*)realloc(rhsValues, rowCap * sizeof(double));
-        if (!t3) { rowCap = oldCap; return 0; }
-        rhsValues = t3;
-        double* t4 = (double*)realloc(rangeVals, rowCap * sizeof(double));
-        if (!t4) { rowCap = oldCap; return 0; }
-        rangeVals = t4;
-        for (int i = oldCap; i < rowCap; i++) {
-            rhsValues[i] = 0.0;
-            rangeVals[i] = 0.0;
-        }
-        return 1;
-    };
-    
-    // --- Helper: find variable index by name ---
-    auto findVar = [&](const char* name) -> int {
-        for (int i = 0; i < numVars; i++) {
-            if (strcmp(varNamesBuf[i].name, name) == 0) return i;
-        }
-        return -1;
-    };
-    
-    // --- Helper: add a new variable, returns its index, or -1 on allocation failure ---
-    auto addVar = [&](const char* name) -> int {
-        if (numVars >= varCap && !growVarArrays()) return -1;
-        strncpy(varNamesBuf[numVars].name, name, 63);
-        varNamesBuf[numVars].name[63] = '\0';
-        objCoeffsTemp[numVars] = 0.0;
-        loBounds[numVars] = 0.0;
-        upBounds[numVars] = DBL_MAX;
-        isInt[numVars] = inIntegerBlock ? 1 : 0;
-        return numVars++;
-    };
-    
-    // --- Helper: find row index (-1 = objective, -2 = not found) ---
-    auto findRow = [&](const char* name) -> int {
-        if (objRowName && strcmp(name, objRowName) == 0) return -1;
-        for (int i = 0; i < numRows; i++) {
-            if (strcmp(rowNames[i], name) == 0) return i;
-        }
-        return -2;
-    };
-    
-    // --- Helper: add a sparse coefficient entry ---
-    // Returns 1 on success, 0 if realloc fails.
-    auto addCoeff = [&](int row, int col, double val) -> int {
-        if (numCoeffs >= coeffCap) {
-            int newCap = coeffCap * 2;
-            CoeffEntry* tmp = (CoeffEntry*)realloc(coeffs, newCap * sizeof(CoeffEntry));
-            if (!tmp) return 0;
-            coeffs = tmp;
-            coeffCap = newCap;
-        }
-        coeffs[numCoeffs].row = row;
-        coeffs[numCoeffs].col = col;
-        coeffs[numCoeffs].value = val;
-        numCoeffs++;
-        return 1;
-    };
-    
-    // ===================== MAIN PARSE LOOP =====================
+
+    /* Initialise parse state */
+    MpsParseState s;
+    memset(&s, 0, sizeof(s));
+    s.rowCap       = MPS_INIT_ROW_CAP;
+    s.varCap       = MPS_INIT_VAR_CAP;
+    s.coeffCap     = MPS_INIT_COEFF_CAP;
+    s.rowNames     = (char**)malloc(s.rowCap * sizeof(char*));
+    s.rowTypes     = (ConstraintType*)malloc(s.rowCap * sizeof(ConstraintType));
+    s.rhsValues    = (double*)calloc(s.rowCap, sizeof(double));
+    s.rangeVals    = (double*)calloc(s.rowCap, sizeof(double));
+    s.varNamesBuf  = (VarName*)malloc(s.varCap * sizeof(VarName));
+    s.objCoeffsTemp = (double*)calloc(s.varCap, sizeof(double));
+    s.loBounds     = (double*)calloc(s.varCap, sizeof(double));
+    s.upBounds     = (double*)malloc(s.varCap * sizeof(double));
+    s.isInt        = (int*)calloc(s.varCap, sizeof(int));
+    s.coeffs       = (CoeffEntry*)malloc(s.coeffCap * sizeof(CoeffEntry));
+    for (int i = 0; i < s.varCap; i++) s.upBounds[i] = DBL_MAX;
+
+    /* ===================== MAIN PARSE LOOP ===================== */
     while (fgets(rawLine, MPS_LINE_BUF_SIZE, file)) {
         stripNewline(rawLine);
-        
-        // Skip empty lines and comments (* in column 1)
-        if (rawLine[0] == '\0') continue;
-        if (rawLine[0] == '*') continue;
-        
-        // --- Section headers start at column 1 (non-space, non-comment) ---
+        if (rawLine[0] == '\0' || rawLine[0] == '*') continue;
+
         if (isMPSSectionHeader(rawLine)) {
             if (strncmp(rawLine, "NAME", 4) == 0) {
-                // Name field starts at column 14 (0-indexed)
-                if ((int)strlen(rawLine) > 14) {
+                if ((int)strlen(rawLine) > 14)
                     extractMPSField(rawLine, 14, 71, lp->name, sizeof(lp->name));
-                }
                 continue;
             }
-            if (strncmp(rawLine, "ROWS", 4) == 0)     { section = SEC_ROWS;    continue; }
-            if (strncmp(rawLine, "COLUMNS", 7) == 0)   { section = SEC_COLUMNS; continue; }
-            if (strncmp(rawLine, "RHS", 3) == 0)       { section = SEC_RHS;     continue; }
-            if (strncmp(rawLine, "BOUNDS", 6) == 0)    { section = SEC_BOUNDS;  continue; }
-            if (strncmp(rawLine, "RANGES", 6) == 0)    { section = SEC_RANGES;  continue; }
-            if (strncmp(rawLine, "ENDATA", 6) == 0)     break;  // *** STOP parsing ***
+            if (strncmp(rawLine, "ROWS",    4) == 0) { section = SEC_ROWS;    continue; }
+            if (strncmp(rawLine, "COLUMNS", 7) == 0) { section = SEC_COLUMNS; continue; }
+            if (strncmp(rawLine, "RHS",     3) == 0) { section = SEC_RHS;     continue; }
+            if (strncmp(rawLine, "BOUNDS",  6) == 0) { section = SEC_BOUNDS;  continue; }
+            if (strncmp(rawLine, "RANGES",  6) == 0) { section = SEC_RANGES;  continue; }
+            if (strncmp(rawLine, "ENDATA",  6) == 0) break;
             if (strncmp(rawLine, "OBJSENSE", 8) == 0) {
                 if (fgets(rawLine, MPS_LINE_BUF_SIZE, file)) {
                     stripNewline(rawLine);
                     char senseBuf[16];
                     extractMPSField(rawLine, 0, 15, senseBuf, sizeof(senseBuf));
-                    char* s = senseBuf;
-                    while (*s == ' ' || *s == '\t') s++;
-                    if (strncmp(s, "MAX", 3) == 0) lp->sense = MAXIMIZE;
-                    else if (strncmp(s, "MIN", 3) == 0) lp->sense = MINIMIZE;
+                    char* s2 = senseBuf;
+                    while (*s2 == ' ' || *s2 == '\t') s2++;
+                    if      (strncmp(s2, "MAX", 3) == 0) lp->sense = MAXIMIZE;
+                    else if (strncmp(s2, "MIN", 3) == 0) lp->sense = MINIMIZE;
                 }
                 continue;
             }
-            // Unknown section — skip its data lines
             section = SEC_UNKNOWN;
             continue;
         }
-        
-        // --- Data lines (start with space/tab) ---
-        // MPS fixed-column fields (0-indexed):
-        //   Field 1: cols  1- 2  (type indicator)
-        //   Field 2: cols  4-11  (name 1, 8 chars)
-        //   Field 3: cols 14-21  (name 2, 8 chars)
-        //   Field 4: cols 24-35  (value 1, 12 chars)
-        //   Field 5: cols 39-46  (name 3, 8 chars)
-        //   Field 6: cols 49-60  (value 2, 12 chars)
-        
-        // ---- ROWS section ----
-        if (section == SEC_ROWS) {
-            char typeField[4], nameField[64];
-            extractMPSField(rawLine, MPS_F1_START, MPS_F1_END, typeField, sizeof(typeField));
-            extractMPSField(rawLine, MPS_F2_START, MPS_F2_END, nameField, sizeof(nameField));
-            
-            if (nameField[0] == '\0') continue;
-            
-            char type = typeField[0];
-            if (type == 'N') {
-                // Only the first N row is used as the objective (per MPS convention)
-                if (!objRowName) {
-                    objRowName = strdup(nameField);
-                    if (!objRowName) goto cleanup;
-                } else {
-                    fprintf(stderr, "Warning: Multiple N rows found. "
-                            "Using '%s' as objective, ignoring '%s'.\n",
-                            objRowName, nameField);
-                }
-            } else {
-                if (numRows >= rowCap && !growRowArrays()) goto cleanup;
-                rowNames[numRows] = strdup(nameField);
-                if (!rowNames[numRows]) goto cleanup;
-                switch (type) {
-                    case 'L': rowTypes[numRows] = CONSTRAINT_LE; break;
-                    case 'G': rowTypes[numRows] = CONSTRAINT_GE; break;
-                    case 'E': rowTypes[numRows] = CONSTRAINT_EQ; break;
-                    default:
-                        fprintf(stderr, "Warning: Unknown row type '%c' for '%s', "
-                                "defaulting to EQ.\n", type, nameField);
-                        rowTypes[numRows] = CONSTRAINT_EQ;
-                }
-                numRows++;
-            }
+
+        /* Data lines — dispatch by current section */
+        switch (section) {
+            case SEC_ROWS:
+                if (!parseRowsLine(rawLine, &s)) goto cleanup;
+                break;
+            case SEC_COLUMNS:
+                if (!parseColumnsLine(rawLine, &s)) goto cleanup;
+                break;
+            case SEC_RHS:
+                parseRhsLine(rawLine, &s, lp);
+                break;
+            case SEC_BOUNDS:
+                parseBoundsLine(rawLine, &s);
+                break;
+            case SEC_RANGES:
+                parseRangesLine(rawLine, &s);
+                break;
+            default:
+                break;  /* SEC_UNKNOWN: silently skip */
         }
-        // ---- COLUMNS section ----
-        else if (section == SEC_COLUMNS) {
-            char field2[64], field3[64], field4[64], field5[64], field6[64];
-            extractMPSField(rawLine, MPS_F2_START, MPS_F2_END, field2, sizeof(field2));  // column name
-            extractMPSField(rawLine, MPS_F3_START, MPS_F3_END, field3, sizeof(field3));  // row name 1
-            extractMPSField(rawLine, MPS_F4_START, MPS_F4_END, field4, sizeof(field4));  // value 1
-            extractMPSField(rawLine, MPS_F5_START, MPS_F5_END, field5, sizeof(field5));  // row name 2
-            extractMPSField(rawLine, MPS_F6_START, MPS_F6_END, field6, sizeof(field6));  // value 2
-            
-            if (field2[0] == '\0') continue;
-            
-            // Handle integer MARKER lines (INTORG / INTEND)
-            if (strcmp(field3, "'MARKER'") == 0 || strcmp(field3, "MARKER") == 0) {
-                if (strstr(field4, "INTORG") || strstr(field5, "INTORG") ||
-                    strstr(field4, "'INTORG'") || strstr(field5, "'INTORG'")) {
-                    inIntegerBlock = 1;
-                } else if (strstr(field4, "INTEND") || strstr(field5, "INTEND") ||
-                           strstr(field4, "'INTEND'") || strstr(field5, "'INTEND'")) {
-                    inIntegerBlock = 0;
-                }
-                continue;
-            }
-            
-            double val1;
-            if (!parseMPSDouble(field4, &val1)) continue;
-            
-            // Find or create variable
-            int varIdx = findVar(field2);
-            if (varIdx < 0) {
-                varIdx = addVar(field2);
-                if (varIdx < 0) goto cleanup;
-            }
-            
-            // First coefficient
-            int rowIdx = findRow(field3);
-            if (rowIdx == -1) {
-                objCoeffsTemp[varIdx] = val1;           // Objective
-            } else if (rowIdx >= 0) {
-                if (!addCoeff(rowIdx, varIdx, val1)) goto cleanup;
-            }
-            
-            // Second coefficient (fields 5+6, optional)
-            double val2;
-            if (field5[0] != '\0' && parseMPSDouble(field6, &val2)) {
-                rowIdx = findRow(field5);
-                if (rowIdx == -1) {
-                    objCoeffsTemp[varIdx] = val2;
-                } else if (rowIdx >= 0) {
-                    if (!addCoeff(rowIdx, varIdx, val2)) goto cleanup;
-                }
-            }
-        }
-        // ---- RHS section ----
-        else if (section == SEC_RHS) {
-            char field2[64], field3[64], field4[64], field5[64], field6[64];
-            extractMPSField(rawLine, MPS_F2_START, MPS_F2_END, field2, sizeof(field2));
-            extractMPSField(rawLine, MPS_F3_START, MPS_F3_END, field3, sizeof(field3));
-            extractMPSField(rawLine, MPS_F4_START, MPS_F4_END, field4, sizeof(field4));
-            extractMPSField(rawLine, MPS_F5_START, MPS_F5_END, field5, sizeof(field5));
-            extractMPSField(rawLine, MPS_F6_START, MPS_F6_END, field6, sizeof(field6));
-            
-            double val1;
-            if (field3[0] != '\0' && parseMPSDouble(field4, &val1)) {
-                int rowIdx = findRow(field3);
-                if (rowIdx >= 0) {
-                    rhsValues[rowIdx] = val1;
-                } else if (rowIdx == -1) {
-                    // Objective constant (RHS entry for the N row)
-                    lp->objConstant = val1;
-                }
-            }
-            
-            double val2;
-            if (field5[0] != '\0' && parseMPSDouble(field6, &val2)) {
-                int rowIdx = findRow(field5);
-                if (rowIdx >= 0) {
-                    rhsValues[rowIdx] = val2;
-                } else if (rowIdx == -1) {
-                    lp->objConstant = val2;
-                }
-            }
-        }
-        // ---- BOUNDS section ----
-        else if (section == SEC_BOUNDS) {
-            // Field 1 (cols 1-2): bound type  (LO, UP, FX, FR, MI, PL, BV, LI, UI)
-            // Field 2 (cols 4-11): bound set name
-            // Field 3 (cols 14-21): variable name
-            // Field 4 (cols 24-35): value (absent for FR, MI, PL, BV)
-            char typeField[4], field2[64], field3[64], field4[64];
-            extractMPSField(rawLine, MPS_F1_START, MPS_F1_END, typeField, sizeof(typeField));
-            extractMPSField(rawLine, MPS_F2_START, MPS_F2_END, field2, sizeof(field2));
-            extractMPSField(rawLine, MPS_F3_START, MPS_F3_END, field3, sizeof(field3));
-            extractMPSField(rawLine, MPS_F4_START, MPS_F4_END, field4, sizeof(field4));
-            
-            if (field3[0] == '\0') continue;
-            
-            int varIdx = findVar(field3);
-            if (varIdx < 0) {
-                fprintf(stderr, "Warning: BOUNDS references unknown variable '%s'.\n",
-                        field3);
-                continue;
-            }
-            
-            double val = 0.0;
-            int hasValue = parseMPSDouble(field4, &val);
-            
-            if (strcmp(typeField, "LO") == 0 && hasValue) {
-                loBounds[varIdx] = val;
-            } else if (strcmp(typeField, "UP") == 0 && hasValue) {
-                upBounds[varIdx] = val;
-            } else if (strcmp(typeField, "FX") == 0 && hasValue) {
-                loBounds[varIdx] = val;
-                upBounds[varIdx] = val;
-            } else if (strcmp(typeField, "FR") == 0) {
-                loBounds[varIdx] = -DBL_MAX;
-                upBounds[varIdx] = DBL_MAX;
-            } else if (strcmp(typeField, "MI") == 0) {
-                loBounds[varIdx] = -DBL_MAX;
-            } else if (strcmp(typeField, "PL") == 0) {
-                upBounds[varIdx] = DBL_MAX;
-            } else if (strcmp(typeField, "BV") == 0) {
-                loBounds[varIdx] = 0.0;
-                upBounds[varIdx] = 1.0;
-                isInt[varIdx] = 1;
-            } else if (strcmp(typeField, "LI") == 0 && hasValue) {
-                loBounds[varIdx] = val;
-                isInt[varIdx] = 1;
-            } else if (strcmp(typeField, "UI") == 0 && hasValue) {
-                upBounds[varIdx] = val;
-                isInt[varIdx] = 1;
-            } else {
-                fprintf(stderr, "Warning: Unknown/invalid bound type '%s' "
-                        "for variable '%s'.\n", typeField, field3);
-            }
-        }
-        // ---- RANGES section ----
-        else if (section == SEC_RANGES) {
-            // Same field layout as RHS: name, row, value [, row, value]
-            char field2[64], field3[64], field4[64], field5[64], field6[64];
-            extractMPSField(rawLine, MPS_F2_START, MPS_F2_END, field2, sizeof(field2));
-            extractMPSField(rawLine, MPS_F3_START, MPS_F3_END, field3, sizeof(field3));
-            extractMPSField(rawLine, MPS_F4_START, MPS_F4_END, field4, sizeof(field4));
-            extractMPSField(rawLine, MPS_F5_START, MPS_F5_END, field5, sizeof(field5));
-            extractMPSField(rawLine, MPS_F6_START, MPS_F6_END, field6, sizeof(field6));
-            
-            double val1;
-            if (field3[0] != '\0' && parseMPSDouble(field4, &val1)) {
-                int rowIdx = findRow(field3);
-                if (rowIdx >= 0) rangeVals[rowIdx] = val1;
-            }
-            
-            double val2;
-            if (field5[0] != '\0' && parseMPSDouble(field6, &val2)) {
-                int rowIdx = findRow(field5);
-                if (rowIdx >= 0) rangeVals[rowIdx] = val2;
-            }
-        }
-        // Unknown section: silently skip data lines
     }
-    
+
     fclose(file);
     file = NULL;
-    
-    // ===================== BUILD LPProblem STRUCTURE =====================
-    lp->numVars = numVars;
-    lp->numConstraints = numRows;
-    
-    // All pointer arrays use calloc so that uninitialized entries are NULL;
-    // this makes freeLPProblem safe to call from the cleanup path even if
-    // we jump there before fully populating every row/variable slot.
-    lp->objCoeffs = (double*)malloc(numVars * sizeof(double));
-    if (!lp->objCoeffs) goto cleanup;
-    memcpy(lp->objCoeffs, objCoeffsTemp, numVars * sizeof(double));
 
-    lp->lowerBounds = (double*)malloc(numVars * sizeof(double));
-    if (!lp->lowerBounds) goto cleanup;
-    memcpy(lp->lowerBounds, loBounds, numVars * sizeof(double));
+    /* ===================== BUILD LPProblem STRUCTURE ===================== */
+    if (!buildLPProblem(lp, &s)) goto cleanup;
 
-    lp->upperBounds = (double*)malloc(numVars * sizeof(double));
-    if (!lp->upperBounds) goto cleanup;
-    memcpy(lp->upperBounds, upBounds, numVars * sizeof(double));
+    /* Free temporary storage (row names transferred to lp->constraintNames) */
+    freeParseState(&s, s.numRows);
 
-    lp->isInteger = (int*)malloc(numVars * sizeof(int));
-    if (!lp->isInteger) goto cleanup;
-    memcpy(lp->isInteger, isInt, numVars * sizeof(int));
-
-    lp->rhs = (double*)malloc(numRows * sizeof(double));
-    if (!lp->rhs) goto cleanup;
-    lp->constraintTypes = (ConstraintType*)malloc(numRows * sizeof(ConstraintType));
-    if (!lp->constraintTypes) goto cleanup;
-    lp->constraintMatrix = (double**)calloc(numRows, sizeof(double*));
-    if (!lp->constraintMatrix) goto cleanup;
-    lp->varNames = (char**)calloc(numVars, sizeof(char*));
-    if (!lp->varNames) goto cleanup;
-    lp->constraintNames = (char**)calloc(numRows, sizeof(char*));
-    if (!lp->constraintNames) goto cleanup;
-    lp->rangeValues = (double*)malloc(numRows * sizeof(double));
-    if (!lp->rangeValues) goto cleanup;
-
-    for (int i = 0; i < numRows; i++) {
-        lp->constraintMatrix[i] = (double*)calloc(numVars, sizeof(double));
-        if (!lp->constraintMatrix[i]) goto cleanup;
-        lp->rhs[i] = rhsValues[i];
-        lp->constraintTypes[i] = rowTypes[i];
-        lp->constraintNames[i] = rowNames[i];   // Transfer ownership
-        lp->rangeValues[i] = rangeVals[i];
-    }
-    
-    for (int i = 0; i < numVars; i++) {
-        lp->varNames[i] = strdup(varNamesBuf[i].name);
-        if (!lp->varNames[i]) goto cleanup;
-    }
-    
-    // Fill constraint matrix from sparse coefficients
-    for (int i = 0; i < numCoeffs; i++) {
-        lp->constraintMatrix[coeffs[i].row][coeffs[i].col] = coeffs[i].value;
-    }
-    
-    // Cleanup temporary storage
-    free(rangeVals);
-    free(rhsValues);
-    free(coeffs);
-    free(isInt);
-    free(upBounds);
-    free(loBounds);
-    free(objCoeffsTemp);
-    free(varNamesBuf);
-    free(rowTypes);
-    free(rowNames);   // Individual names transferred; only free the pointer array
-    if (objRowName) free(objRowName);
-    
     if (config && config->verbose) {
         printf("Parsed LP: %s\n", lp->name);
         printf("  Variables: %d\n", lp->numVars);
@@ -708,24 +772,13 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
         if (lp->objConstant != 0.0)
             printf("  Objective constant: %.6f\n", lp->objConstant);
     }
-    
+
     return lp;
 
 cleanup:
     if (file) fclose(file);
-    free(rangeVals);
-    free(rhsValues);
-    free(coeffs);
-    free(isInt);
-    free(upBounds);
-    free(loBounds);
-    free(objCoeffsTemp);
-    free(varNamesBuf);
-    free(rowTypes);
-    // Free row names not yet transferred to lp (freeLPProblem handles lp->constraintNames[0..numConstraints-1])
-    for (int i = lp->numConstraints; i < numRows; i++) free(rowNames[i]);
-    free(rowNames);
-    free(objRowName);
+    /* Free row names not yet transferred (lp->numConstraints tracks how many were) */
+    freeParseState(&s, lp->numConstraints);
     freeLPProblem(lp);
     return NULL;
 }
