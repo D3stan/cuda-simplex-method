@@ -2,7 +2,34 @@
 
 // ===========================================================================
 
-static int hasFileExtensionIgnoreCase(const char* filename, const char* extension) {
+/* Buffer and initial-capacity constants for the MPS parser */
+#define MPS_LINE_BUF_SIZE   1024   /* max bytes per input line (incl. NUL) */
+#define MPS_INIT_ROW_CAP      64   /* initial row array capacity           */
+#define MPS_INIT_VAR_CAP      64   /* initial variable array capacity      */
+#define MPS_INIT_COEFF_CAP   256   /* initial sparse-coefficient capacity  */
+
+/* MPS fixed-column field boundaries (0-indexed, inclusive).
+ * Reference: MPS format standard, fixed-column variant.
+ *   Field 1 (type indicator): cols  1– 2
+ *   Field 2 (name 1):         cols  4–11
+ *   Field 3 (name 2):         cols 14–21
+ *   Field 4 (value 1):        cols 24–35
+ *   Field 5 (name 3):         cols 39–46
+ *   Field 6 (value 2):        cols 49–60 */
+#define MPS_F1_START  1
+#define MPS_F1_END    2
+#define MPS_F2_START  4
+#define MPS_F2_END   11
+#define MPS_F3_START 14
+#define MPS_F3_END   21
+#define MPS_F4_START 24
+#define MPS_F4_END   35
+#define MPS_F5_START 39
+#define MPS_F5_END   46
+#define MPS_F6_START 49
+#define MPS_F6_END   60
+
+int hasFileExtensionIgnoreCase(const char* filename, const char* extension) {
     if (!filename || !extension) return 0;
     size_t n = strlen(filename);
     size_t e = strlen(extension);
@@ -216,11 +243,11 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
     lp->sense = MINIMIZE;
     lp->objConstant = 0.0;
     
-    char rawLine[1024];
+    char rawLine[MPS_LINE_BUF_SIZE];
     char section[64] = "";
     
     // --- Dynamic storage for rows ---
-    int rowCap = 64;
+    int rowCap = MPS_INIT_ROW_CAP;
     int numRows = 0;
     char** rowNames = (char**)malloc(rowCap * sizeof(char*));
     ConstraintType* rowTypes = (ConstraintType*)malloc(rowCap * sizeof(ConstraintType));
@@ -229,7 +256,7 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
     char* objRowName = NULL;
     
     // --- Dynamic storage for variables ---
-    int varCap = 64;
+    int varCap = MPS_INIT_VAR_CAP;
     int numVars = 0;
     typedef struct { char name[64]; } VarName;
     VarName* varNamesBuf = (VarName*)malloc(varCap * sizeof(VarName));
@@ -240,7 +267,7 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
     for (int i = 0; i < varCap; i++) upBounds[i] = DBL_MAX;
     
     // --- Dynamic storage for sparse coefficients ---
-    int coeffCap = 256;
+    int coeffCap = MPS_INIT_COEFF_CAP;
     int numCoeffs = 0;
     typedef struct { int row; int col; double value; } CoeffEntry;
     CoeffEntry* coeffs = (CoeffEntry*)malloc(coeffCap * sizeof(CoeffEntry));
@@ -321,7 +348,7 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
     };
     
     // ===================== MAIN PARSE LOOP =====================
-    while (fgets(rawLine, sizeof(rawLine), file)) {
+    while (fgets(rawLine, MPS_LINE_BUF_SIZE, file)) {
         stripNewline(rawLine);
         
         // Skip empty lines and comments (* in column 1)
@@ -344,7 +371,7 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
             if (strncmp(rawLine, "RANGES", 6) == 0)     { strcpy(section, "RANGES"); continue; }
             if (strncmp(rawLine, "ENDATA", 6) == 0)     break;  // *** STOP parsing ***
             if (strncmp(rawLine, "OBJSENSE", 8) == 0) {
-                if (fgets(rawLine, sizeof(rawLine), file)) {
+                if (fgets(rawLine, MPS_LINE_BUF_SIZE, file)) {
                     stripNewline(rawLine);
                     char senseBuf[16];
                     extractMPSField(rawLine, 0, 15, senseBuf, sizeof(senseBuf));
@@ -372,8 +399,8 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
         // ---- ROWS section ----
         if (strcmp(section, "ROWS") == 0) {
             char typeField[4], nameField[64];
-            extractMPSField(rawLine, 1, 2, typeField, sizeof(typeField));
-            extractMPSField(rawLine, 4, 11, nameField, sizeof(nameField));
+            extractMPSField(rawLine, MPS_F1_START, MPS_F1_END, typeField, sizeof(typeField));
+            extractMPSField(rawLine, MPS_F2_START, MPS_F2_END, nameField, sizeof(nameField));
             
             if (nameField[0] == '\0') continue;
             
@@ -405,11 +432,11 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
         // ---- COLUMNS section ----
         else if (strcmp(section, "COLUMNS") == 0) {
             char field2[64], field3[64], field4[64], field5[64], field6[64];
-            extractMPSField(rawLine,  4, 11, field2, sizeof(field2));  // column name
-            extractMPSField(rawLine, 14, 21, field3, sizeof(field3));  // row name 1
-            extractMPSField(rawLine, 24, 35, field4, sizeof(field4));  // value 1
-            extractMPSField(rawLine, 39, 46, field5, sizeof(field5));  // row name 2
-            extractMPSField(rawLine, 49, 60, field6, sizeof(field6));  // value 2
+            extractMPSField(rawLine, MPS_F2_START, MPS_F2_END, field2, sizeof(field2));  // column name
+            extractMPSField(rawLine, MPS_F3_START, MPS_F3_END, field3, sizeof(field3));  // row name 1
+            extractMPSField(rawLine, MPS_F4_START, MPS_F4_END, field4, sizeof(field4));  // value 1
+            extractMPSField(rawLine, MPS_F5_START, MPS_F5_END, field5, sizeof(field5));  // row name 2
+            extractMPSField(rawLine, MPS_F6_START, MPS_F6_END, field6, sizeof(field6));  // value 2
             
             if (field2[0] == '\0') continue;
             
@@ -454,11 +481,11 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
         // ---- RHS section ----
         else if (strcmp(section, "RHS") == 0) {
             char field2[64], field3[64], field4[64], field5[64], field6[64];
-            extractMPSField(rawLine,  4, 11, field2, sizeof(field2));
-            extractMPSField(rawLine, 14, 21, field3, sizeof(field3));
-            extractMPSField(rawLine, 24, 35, field4, sizeof(field4));
-            extractMPSField(rawLine, 39, 46, field5, sizeof(field5));
-            extractMPSField(rawLine, 49, 60, field6, sizeof(field6));
+            extractMPSField(rawLine, MPS_F2_START, MPS_F2_END, field2, sizeof(field2));
+            extractMPSField(rawLine, MPS_F3_START, MPS_F3_END, field3, sizeof(field3));
+            extractMPSField(rawLine, MPS_F4_START, MPS_F4_END, field4, sizeof(field4));
+            extractMPSField(rawLine, MPS_F5_START, MPS_F5_END, field5, sizeof(field5));
+            extractMPSField(rawLine, MPS_F6_START, MPS_F6_END, field6, sizeof(field6));
             
             double val1;
             if (field3[0] != '\0' && parseMPSDouble(field4, &val1)) {
@@ -488,10 +515,10 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
             // Field 3 (cols 14-21): variable name
             // Field 4 (cols 24-35): value (absent for FR, MI, PL, BV)
             char typeField[4], field2[64], field3[64], field4[64];
-            extractMPSField(rawLine,  1,  2, typeField, sizeof(typeField));
-            extractMPSField(rawLine,  4, 11, field2, sizeof(field2));
-            extractMPSField(rawLine, 14, 21, field3, sizeof(field3));
-            extractMPSField(rawLine, 24, 35, field4, sizeof(field4));
+            extractMPSField(rawLine, MPS_F1_START, MPS_F1_END, typeField, sizeof(typeField));
+            extractMPSField(rawLine, MPS_F2_START, MPS_F2_END, field2, sizeof(field2));
+            extractMPSField(rawLine, MPS_F3_START, MPS_F3_END, field3, sizeof(field3));
+            extractMPSField(rawLine, MPS_F4_START, MPS_F4_END, field4, sizeof(field4));
             
             if (field3[0] == '\0') continue;
             
@@ -538,11 +565,11 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
         else if (strcmp(section, "RANGES") == 0) {
             // Same field layout as RHS: name, row, value [, row, value]
             char field2[64], field3[64], field4[64], field5[64], field6[64];
-            extractMPSField(rawLine,  4, 11, field2, sizeof(field2));
-            extractMPSField(rawLine, 14, 21, field3, sizeof(field3));
-            extractMPSField(rawLine, 24, 35, field4, sizeof(field4));
-            extractMPSField(rawLine, 39, 46, field5, sizeof(field5));
-            extractMPSField(rawLine, 49, 60, field6, sizeof(field6));
+            extractMPSField(rawLine, MPS_F2_START, MPS_F2_END, field2, sizeof(field2));
+            extractMPSField(rawLine, MPS_F3_START, MPS_F3_END, field3, sizeof(field3));
+            extractMPSField(rawLine, MPS_F4_START, MPS_F4_END, field4, sizeof(field4));
+            extractMPSField(rawLine, MPS_F5_START, MPS_F5_END, field5, sizeof(field5));
+            extractMPSField(rawLine, MPS_F6_START, MPS_F6_END, field6, sizeof(field6));
             
             double val1;
             if (field3[0] != '\0' && parseMPSDouble(field4, &val1)) {

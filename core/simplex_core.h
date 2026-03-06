@@ -19,6 +19,10 @@ double hpc_gettime(void);
 #define REFACTOR_INTERVAL 50
 #define BLOCK_SIZE 256
 #define TILE_SIZE 16
+/* Big-M penalty: large enough to dominate any legitimate reduced cost,
+ * small enough to avoid floating-point overflow in tableau arithmetic.
+ * Must satisfy: BIG_M >> max expected |reduced cost|, and BIG_M^2 < DBL_MAX. */
+#define BIG_M 1e20
 
 #define CUDA_CHECK(call) \
     do { \

@@ -328,7 +328,7 @@ void setupPhase2(Tableau* tab, const double* originalObjective) {
             if (tab->hostBasicVars[i] == j) { isBasic = 1; break; }
         }
         if (!isBasic) {
-            tab->hostData[j] = 1e20;  // Block from entering
+            tab->hostData[j] = BIG_M;  // Block from entering
         }
         // Basic artificials should have reduced cost 0 (already handled by canonicalization)
     }
@@ -534,7 +534,7 @@ void rederiveObjectiveRow(Tableau* tab, const double* phaseCosts, int blockArt) 
                 if (tab->hostBasicVars[i] == j) { isBasic = 1; break; }
             }
             if (!isBasic) {
-                tab->hostData[j] = 1e20;
+                tab->hostData[j] = BIG_M;
             }
         }
     }
@@ -676,7 +676,7 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* pha
                 } else {
                     // No positive entries at all in pivot column — skip this column
                     // Set its reduced cost to +inf to block it, try next column
-                    double bigval = 1e20;
+                    double bigval = BIG_M;
                     tab->hostData[h_pivotCol] = bigval;
                     CUDA_CHECK(cudaMemcpy(&tab->data[h_pivotCol], &bigval,
                                           sizeof(double), cudaMemcpyHostToDevice));

@@ -6,22 +6,10 @@
 
 // ===========================================================================
 
-static int hasFileExtensionIgnoreCase(const char* filename, const char* extension) {
-    if (!filename || !extension) return 0;
-    size_t n = strlen(filename);
-    size_t e = strlen(extension);
-    if (n < e) return 0;
-
-    const char* tail = filename + (n - e);
-    for (size_t i = 0; i < e; i++) {
-        char a = tail[i];
-        char b = extension[i];
-        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
-        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
-        if (a != b) return 0;
-    }
-    return 1;
-}
+/* Buffer and batch-limit constants */
+#define REPL_LINE_BUF_SIZE  1024   /* max bytes per interactive REPL command (incl. NUL) */
+#define MAX_PATH_BUF_SIZE    512   /* max bytes for a constructed filesystem path        */
+#define MAX_BATCH_FILES     4096   /* max number of files in a single batch run          */
 
 static int isSupportedInputFile(const char* filename) {
     return hasFileExtensionIgnoreCase(filename, ".mps") ||
@@ -56,7 +44,7 @@ int solveFile(const char* filename, cudaDeviceProp* prop, SolverConfig* config, 
  * Commands: help, quit/exit, set <option> <value>, or a filename to solve.
  */
 void interactiveMode(cudaDeviceProp* prop, SolverConfig* config, RunContext* run) {
-    char line[1024];
+    char line[REPL_LINE_BUF_SIZE];
     
     printf("CUDA Simplex — Interactive Mode\n");
     printf("Type a .mps or .dat filename to solve, or 'help' for commands.\n\n");
@@ -65,7 +53,7 @@ void interactiveMode(cudaDeviceProp* prop, SolverConfig* config, RunContext* run
         printf("simplex> ");
         fflush(stdout);
         
-        if (!fgets(line, sizeof(line), stdin)) {
+        if (!fgets(line, REPL_LINE_BUF_SIZE, stdin)) {
             printf("\n");
             break;  // EOF
         }
@@ -234,7 +222,7 @@ int runApp(int argc, char* argv[]) {
     // In batch mode, auto-expand directory arguments into .mps/.dat files
     if (batchMode) {
         int expandedCount = 0;
-        const char** expandedFiles = (const char**)malloc(4096 * sizeof(const char*));
+        const char** expandedFiles = (const char**)malloc(MAX_BATCH_FILES * sizeof(const char*));
         
         for (int i = 0; i < inputCount; i++) {
             struct stat st;
@@ -244,8 +232,8 @@ int runApp(int argc, char* argv[]) {
                     struct dirent* entry;
                     while ((entry = readdir(dir)) != NULL) {
                         if (isSupportedInputFile(entry->d_name)) {
-                            char* fullpath = (char*)malloc(512);
-                            snprintf(fullpath, 512, "%s/%s", inputFiles[i], entry->d_name);
+                            char* fullpath = (char*)malloc(MAX_PATH_BUF_SIZE);
+                            snprintf(fullpath, MAX_PATH_BUF_SIZE, "%s/%s", inputFiles[i], entry->d_name);
                             expandedFiles[expandedCount++] = fullpath;
                         }
                     }
