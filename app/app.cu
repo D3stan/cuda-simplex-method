@@ -6,6 +6,28 @@
 
 // ===========================================================================
 
+static int hasFileExtensionIgnoreCase(const char* filename, const char* extension) {
+    if (!filename || !extension) return 0;
+    size_t n = strlen(filename);
+    size_t e = strlen(extension);
+    if (n < e) return 0;
+
+    const char* tail = filename + (n - e);
+    for (size_t i = 0; i < e; i++) {
+        char a = tail[i];
+        char b = extension[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+static int isSupportedInputFile(const char* filename) {
+    return hasFileExtensionIgnoreCase(filename, ".mps") ||
+           hasFileExtensionIgnoreCase(filename, ".dat");
+}
+
 /**
  * Solve a single file (shared logic for interactive + normal mode).
  * Returns the exit code (0 = OPTIMAL, 1 = other).
@@ -221,10 +243,7 @@ int runApp(int argc, char* argv[]) {
                 if (dir) {
                     struct dirent* entry;
                     while ((entry = readdir(dir)) != NULL) {
-                        int len = (int)strlen(entry->d_name);
-                        int isMps = (len > 4 && strcmp(entry->d_name + len - 4, ".mps") == 0);
-                        int isDat = (len > 4 && strcmp(entry->d_name + len - 4, ".dat") == 0);
-                        if (isMps || isDat) {
+                        if (isSupportedInputFile(entry->d_name)) {
                             char* fullpath = (char*)malloc(512);
                             snprintf(fullpath, 512, "%s/%s", inputFiles[i], entry->d_name);
                             expandedFiles[expandedCount++] = fullpath;
