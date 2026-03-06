@@ -2,6 +2,153 @@
 
 // ===========================================================================
 
+static int hasFileExtensionIgnoreCase(const char* filename, const char* extension) {
+    if (!filename || !extension) return 0;
+    size_t n = strlen(filename);
+    size_t e = strlen(extension);
+    if (n < e) return 0;
+
+    const char* tail = filename + (n - e);
+    for (size_t i = 0; i < e; i++) {
+        char a = tail[i];
+        char b = extension[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+static LPProblem* parseDAT(const char* filename, const SolverConfig* config) {
+    FILE* file = fopen(filename, "r");
+    if (!file) {
+        fprintf(stderr, "Error: Cannot open file %s\n", filename);
+        return NULL;
+    }
+
+    int numVars = 0;
+    int numRows = 0;
+    if (fscanf(file, "%d %d", &numVars, &numRows) != 2 || numVars <= 0 || numRows <= 0) {
+        fprintf(stderr, "Error: Invalid DAT header in %s (expected: <numVars> <numConstraints>)\n", filename);
+        fclose(file);
+        return NULL;
+    }
+
+    LPProblem* lp = (LPProblem*)calloc(1, sizeof(LPProblem));
+    lp->numVars = numVars;
+    lp->numConstraints = numRows;
+    lp->sense = MINIMIZE;
+    lp->objConstant = 0.0;
+
+    const char* base = strrchr(filename, '/');
+    base = base ? base + 1 : filename;
+    strncpy(lp->name, base, sizeof(lp->name) - 1);
+    lp->name[sizeof(lp->name) - 1] = '\0';
+
+    lp->objCoeffs = (double*)calloc(numVars, sizeof(double));
+    lp->rhs = (double*)malloc(numRows * sizeof(double));
+    lp->constraintTypes = (ConstraintType*)malloc(numRows * sizeof(ConstraintType));
+    lp->constraintMatrix = (double**)calloc(numRows, sizeof(double*));
+    lp->lowerBounds = (double*)calloc(numVars, sizeof(double));
+    lp->upperBounds = (double*)malloc(numVars * sizeof(double));
+    lp->isInteger = (int*)calloc(numVars, sizeof(int));
+    lp->rangeValues = (double*)calloc(numRows, sizeof(double));
+    lp->varNames = (char**)calloc(numVars, sizeof(char*));
+    lp->constraintNames = (char**)calloc(numRows, sizeof(char*));
+
+    for (int j = 0; j < numVars; j++) lp->upperBounds[j] = DBL_MAX;
+
+    for (int i = 0; i < numRows; i++) {
+        lp->constraintMatrix[i] = (double*)calloc(numVars, sizeof(double));
+    }
+
+    for (int i = 0; i < numRows; i++) {
+        if (fscanf(file, "%lf", &lp->rhs[i]) != 1) {
+            fprintf(stderr, "Error: Invalid RHS data at constraint %d in %s\n", i + 1, filename);
+            fclose(file);
+            freeLPProblem(lp);
+            return NULL;
+        }
+    }
+
+    for (int i = 0; i < numRows; i++) {
+        int typeFlag = 0;
+        if (fscanf(file, "%d", &typeFlag) != 1) {
+            fprintf(stderr, "Error: Invalid constraint type at row %d in %s\n", i + 1, filename);
+            fclose(file);
+            freeLPProblem(lp);
+            return NULL;
+        }
+
+        if (typeFlag == 1) lp->constraintTypes[i] = CONSTRAINT_LE;
+        else if (typeFlag == -1) lp->constraintTypes[i] = CONSTRAINT_GE;
+        else if (typeFlag == 0) lp->constraintTypes[i] = CONSTRAINT_EQ;
+        else {
+            fprintf(stderr, "Warning: Unknown DAT constraint type %d at row %d; defaulting to EQ.\n",
+                    typeFlag, i + 1);
+            lp->constraintTypes[i] = CONSTRAINT_EQ;
+        }
+    }
+
+    for (int j = 0; j < numVars; j++) {
+        double objCoeff = 0.0;
+        int nnz = 0;
+        if (fscanf(file, "%lf %d", &objCoeff, &nnz) != 2 || nnz < 0) {
+            fprintf(stderr, "Error: Invalid column header for variable %d in %s\n", j + 1, filename);
+            fclose(file);
+            freeLPProblem(lp);
+            return NULL;
+        }
+
+        lp->objCoeffs[j] = objCoeff;
+
+        for (int k = 0; k < nnz; k++) {
+            int rowIndex = 0;
+            double val = 0.0;
+            if (fscanf(file, "%d %lf", &rowIndex, &val) != 2) {
+                fprintf(stderr, "Error: Invalid sparse entry %d for variable %d in %s\n",
+                        k + 1, j + 1, filename);
+                fclose(file);
+                freeLPProblem(lp);
+                return NULL;
+            }
+
+            if (rowIndex < 1 || rowIndex > numRows) {
+                fprintf(stderr, "Error: DAT row index out of range (%d) for variable %d in %s\n",
+                        rowIndex, j + 1, filename);
+                fclose(file);
+                freeLPProblem(lp);
+                return NULL;
+            }
+
+            lp->constraintMatrix[rowIndex - 1][j] = val;
+        }
+    }
+
+    for (int j = 0; j < numVars; j++) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "x%d", j + 1);
+        lp->varNames[j] = strdup(buf);
+    }
+
+    for (int i = 0; i < numRows; i++) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "c%d", i + 1);
+        lp->constraintNames[i] = strdup(buf);
+    }
+
+    fclose(file);
+
+    if (config && config->verbose) {
+        printf("Parsed LP (DAT): %s\n", lp->name);
+        printf("  Variables: %d\n", lp->numVars);
+        printf("  Constraints: %d\n", lp->numConstraints);
+        printf("  Sense: MINIMIZE\n");
+    }
+
+    return lp;
+}
+
 // Strip trailing newline/CR only (preserve column positions for fixed-format)
 static void stripNewline(char* str) {
     int len = (int)strlen(str);
@@ -52,6 +199,10 @@ static int isMPSSectionHeader(const char* line) {
  * Stops strictly at ENDATA.
  */
 LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
+    if (hasFileExtensionIgnoreCase(filename, ".dat")) {
+        return parseDAT(filename, config);
+    }
+
     FILE* file = fopen(filename, "r");
     if (!file) {
         fprintf(stderr, "Error: Cannot open file %s\n", filename);

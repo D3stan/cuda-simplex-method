@@ -37,7 +37,7 @@ void interactiveMode(cudaDeviceProp* prop, SolverConfig* config, RunContext* run
     char line[1024];
     
     printf("CUDA Simplex — Interactive Mode\n");
-    printf("Type a .mps filename to solve, or 'help' for commands.\n\n");
+    printf("Type a .mps or .dat filename to solve, or 'help' for commands.\n\n");
     
     while (1) {
         printf("simplex> ");
@@ -61,7 +61,7 @@ void interactiveMode(cudaDeviceProp* prop, SolverConfig* config, RunContext* run
             break;
         } else if (strcmp(line, "help") == 0) {
             printf("Commands:\n");
-            printf("  <file.mps>              Solve an MPS file\n");
+            printf("  <file.mps|file.dat>     Solve an LP file\n");
             printf("  set verbose <0|1|2>     Set verbosity level\n");
             printf("  set debug <0|1>         Toggle tableau printing\n");
             printf("  set format <text|json|csv>  Output format\n");
@@ -118,7 +118,7 @@ void interactiveMode(cudaDeviceProp* prop, SolverConfig* config, RunContext* run
 
 void printUsage(const char* progName) {
     fprintf(stderr, "CUDA Two-Phase Simplex Solver\n\n");
-    fprintf(stderr, "Usage: %s [options] <problem.mps> [...]\n\n", progName);
+    fprintf(stderr, "Usage: %s [options] <problem.{mps,dat}> [...]\n\n", progName);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -s, --silent         Suppress solver output\n");
     fprintf(stderr, "  -d, --debug          Print initial, intermediate, and final tableaux\n");
@@ -133,13 +133,15 @@ void printUsage(const char* progName) {
     fprintf(stderr, "  -h, --help           Show this help message\n\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s problem.mps\n", progName);
+    fprintf(stderr, "  %s problem.dat\n", progName);
     fprintf(stderr, "  %s -d problem.mps              # show all tableaux\n", progName);
-    fprintf(stderr, "  %s -m 1000 -t 5 problem.mps    # max 1000 iters, 5s timeout\n", progName);
+    fprintf(stderr, "  %s -m 1000 -t 5 problem.dat    # max 1000 iters, 5s timeout\n", progName);
     fprintf(stderr, "  %s -i                           # interactive mode\n", progName);
     fprintf(stderr, "  %s --json problem.mps\n", progName);
     fprintf(stderr, "  %s --batch netlib/*.mps\n", progName);
+    fprintf(stderr, "  %s --batch Dati-LP/*.dat\n", progName);
     fprintf(stderr, "  %s --batch netlib/\n", progName);
-    fprintf(stderr, "  %s --log iter.csv problem.mps\n", progName);
+    fprintf(stderr, "  %s --log iter.csv problem.dat\n", progName);
 }
 
 
@@ -207,7 +209,7 @@ int runApp(int argc, char* argv[]) {
         }
     }
     
-    // In batch mode, auto-expand directory arguments into .mps files
+    // In batch mode, auto-expand directory arguments into .mps/.dat files
     if (batchMode) {
         int expandedCount = 0;
         const char** expandedFiles = (const char**)malloc(4096 * sizeof(const char*));
@@ -220,7 +222,9 @@ int runApp(int argc, char* argv[]) {
                     struct dirent* entry;
                     while ((entry = readdir(dir)) != NULL) {
                         int len = (int)strlen(entry->d_name);
-                        if (len > 4 && strcmp(entry->d_name + len - 4, ".mps") == 0) {
+                        int isMps = (len > 4 && strcmp(entry->d_name + len - 4, ".mps") == 0);
+                        int isDat = (len > 4 && strcmp(entry->d_name + len - 4, ".dat") == 0);
+                        if (isMps || isDat) {
                             char* fullpath = (char*)malloc(512);
                             snprintf(fullpath, 512, "%s/%s", inputFiles[i], entry->d_name);
                             expandedFiles[expandedCount++] = fullpath;
@@ -381,7 +385,7 @@ int runApp(int argc, char* argv[]) {
         } else {
             if (config.outputFormat == OUTPUT_TEXT && config.verbose) {
                 printf("No input file provided. Using test problem.\n\n");
-                printf("Usage: %s [options] <problem.mps>\n\n", argv[0]);
+                printf("Usage: %s [options] <problem.{mps,dat}>\n\n", argv[0]);
             }
             lp = createTestProblem();
             
