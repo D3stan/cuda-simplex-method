@@ -17,6 +17,13 @@ double hpc_gettime(void);
 #define HARRIS_TOL 1e-5
 #define PERTURB_EPS 1e-4
 #define REFACTOR_INTERVAL 50
+/* Full constraint-column refactorization interval (Phase 2 only).  Set to a
+ * very large value so periodic full refactorization is effectively disabled;
+ * the LU-based column re-derivation is triggered on-demand in the recovery
+ * path when the ratio test fails. */
+#define REFACTOR_COL_INTERVAL 999999
+/* PHASE2_PERTURB_EPS intentionally unused — kept for reference. */
+#define PHASE2_PERTURB_EPS 1e-4
 #define BLOCK_SIZE 256
 #define TILE_SIZE 16
 /* Big-M penalty: large enough to dominate any legitimate reduced cost,

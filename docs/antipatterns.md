@@ -143,7 +143,7 @@ If the CUDA check fails between steps 3 and 5, both `inputFiles` and `expandedFi
 
 ---
 
-### L. Memory Leak — `realloc` Failure in `parseMPS`
+### L. Memory Leak — `realloc` Failure in `parseMPS` - Fixed
 
 **Detail**: `parseMPS` allocates the following temporary arrays before the parse loop:
 `rowNames`, `rowTypes`, `rhsValues`, `rangeVals`, `varNamesBuf`, `objCoeffsTemp`, `loBounds`, `upBounds`, `isInt`, `coeffs`.
@@ -152,7 +152,7 @@ At the bottom of the function, all of these are freed explicitly. However, there
 
 ---
 
-### M. Buffer Overflow Risk — Path Assembly in Batch Directory Expansion
+### M. Buffer Overflow Risk — Path Assembly in Batch Directory Expansion - Fixed
 
 **Detail**: The vulnerability is:
 
@@ -165,7 +165,7 @@ snprintf(fullpath, 512, "%s/%s", inputFiles[i], entry->d_name);
 
 ---
 
-### N. Naming Inconsistency — Three Names for the Same Concept
+### N. Naming Inconsistency — Three Names for the Same Concept - Fixed
 
 **Detail**: The number of constraints in an LP problem is:
 - `lp->numConstraints` in `LPProblem` (defined in `simplex_core.h` and used in `parser.cu`, `solver.cu`, `io.cu`)
@@ -176,7 +176,7 @@ The divergence between `numRows` and `numConstraints` is a logical consequence o
 
 ---
 
-### O. `strcpy` for Known-Length Constants
+### O. `strcpy` for Known-Length Constants - Fixed
 
 **Detail**: The five consecutive `strcpy` calls to assign section names in `parseMPS`:
 
@@ -190,7 +190,7 @@ The `section` buffer is declared as `char section[64]`. The longest section name
 
 ---
 
-### P. Macro-Aliased Config/Run Fields
+### P. Macro-Aliased Config/Run Fields - Fixed
 
 **Detail**: The eight macros defined at the top of `solver.cu`:
 

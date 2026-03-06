@@ -251,8 +251,16 @@ int runApp(int argc, char* argv[]) {
                                         MAX_BATCH_FILES, inputFiles[i], entry->d_name);
                                 continue;
                             }
-                            char* fullpath = (char*)malloc(MAX_PATH_BUF_SIZE);
-                            snprintf(fullpath, MAX_PATH_BUF_SIZE, "%s/%s", inputFiles[i], entry->d_name);
+                            size_t pathlen = strlen(inputFiles[i]) + 1 + strlen(entry->d_name) + 1;
+                            char* fullpath = (char*)malloc(pathlen);
+                            if (!fullpath) {
+                                fprintf(stderr, "Error: out of memory assembling path\n");
+                                closedir(dir);
+                                freeInputFiles(expandedFiles, expandedOwned, expandedCount);
+                                freeInputFiles(inputFiles, NULL, 0);
+                                return EXIT_FAILURE;
+                            }
+                            snprintf(fullpath, pathlen, "%s/%s", inputFiles[i], entry->d_name);
                             expandedOwned[expandedCount] = 1;   // this entry is heap-allocated
                             expandedFiles[expandedCount++] = fullpath;
                         }

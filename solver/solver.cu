@@ -6,15 +6,6 @@ extern __global__ void kernelFindPivotRow(const double*, int, int, int, double*,
 extern __global__ void kernelUpdateTableau(double*, int, int, int, int, const double*, const double*);
 extern __global__ void kernelCachePivotData(const double*, int, int, int, int, double*, double*);
 
-#define g_verbose (config->verbose)
-#define g_outputFormat (config->outputFormat)
-#define g_iterLog (config->iterLog)
-#define g_debug (config->debug)
-#define g_maxIter (config->maxIter)
-#define g_timeout (config->timeout)
-#define g_phase (run->phase)
-#define g_totalIterations (run->totalIterations)
-#define g_solveStartTime (run->solveStartTime)
 
 // ===========================================================================
 
@@ -75,7 +66,7 @@ Tableau* createTableau(LPProblem* lp, const SolverConfig* config) {
     tab->rows = lp->numConstraints + 1;
     tab->cols = lp->numVars + numSlack + numSurplus + numArtificial + 1;
     
-    if (g_verbose) {
+    if (config->verbose) {
         printf("Tableau dimensions: %d x %d\n", tab->rows, tab->cols);
         printf("  Original variables: %d\n", lp->numVars);
         printf("  Slack variables: %d\n", numSlack);
@@ -450,7 +441,7 @@ static int extractArtificialBasis(Tableau* tab, SolverConfig* config) {
                 tab->hostBasicVars[i] = entering;
                 changedThisPass = 1;
                 status |= 1;
-                if (g_verbose >= 2) {
+                if (config->verbose >= 2) {
                     printf("[DIAG] Extracted artificial var via pivot: row %d, enter col %d\n", row, entering);
                 }
                 break;
@@ -458,7 +449,7 @@ static int extractArtificialBasis(Tableau* tab, SolverConfig* config) {
 
             double rhsVal = tab->hostData[row * tab->cols + rhsCol];
             if (fabs(rhsVal) > 1e-8) {
-                if (g_verbose) {
+                if (config->verbose) {
                     printf("Error: Artificial variable in basis has non-zero value (row %d, rhs %.6e)\n",
                            row, rhsVal);
                 }
@@ -475,7 +466,7 @@ static int extractArtificialBasis(Tableau* tab, SolverConfig* config) {
             }
 
             if (!safeToDrop) {
-                if (g_verbose >= 2) {
+                if (config->verbose >= 2) {
                     printf("[DIAG] Kept degenerate artificial in basis at row %d (row not removable safely)\n", row);
                 }
                 continue;
@@ -484,7 +475,7 @@ static int extractArtificialBasis(Tableau* tab, SolverConfig* config) {
             if (!eliminateDegenerateArtificialRowCol(tab, i, basicVar)) return -1;
             changedThisPass = 1;
             status |= 2;
-            if (g_verbose >= 2) {
+            if (config->verbose >= 2) {
                 printf("[DIAG] Removed degenerate row %d and artificial column %d\n", row, basicVar);
             }
             break;
@@ -544,6 +535,156 @@ void rederiveObjectiveRow(Tableau* tab, const double* phaseCosts, int blockArt) 
                           tab->cols * sizeof(double), cudaMemcpyHostToDevice));
 }
 
+// ===========================================================================
+// PERIODIC CONSTRAINT COLUMN REFACTORIZATION
+// ===========================================================================
+
+/**
+ * Context for periodic Phase 2 constraint column refactorization.
+ * Built once after Phase 1 and passed into runSimplexPhase.
+ */
+typedef struct {
+    LPProblem*    lp;
+    const int*    initialBasisCol;  /* col index of initial basis var for constraint k */
+    const int*    varToConstraint;  /* for slack/surplus col j: which constraint row it belongs to */
+    const double* varCoeffSign;     /* +1 (slack/artificial) or -1 (surplus) */
+    int           artStart;         /* first artificial variable column index */
+} RefactorContext;
+
+/* Return the original coefficient of variable j in constraint row i from the
+ * un-modified LP data.  Works for original vars, slacks, surpluses, and
+ * artificials (which all have at most one non-zero entry in their original col). */
+static inline double getOrigAij(int j, int i, const LPProblem* lp,
+                                 const int* varToConstraint,
+                                 const double* varCoeffSign)
+{
+    if (j < lp->numVars) return lp->constraintMatrix[i][j];
+    return (varToConstraint[j] == i) ? varCoeffSign[j] : 0.0;
+}
+
+/**
+ * Full basis refactorization via Gauss-Jordan elimination.
+ *
+ * Rebuilds B from original LP data (zero accumulated drift), inverts it
+ * exactly, then re-derives every non-basic column and the RHS using the
+ * fresh B^{-1}.  Basic-variable columns are restored to canonical identity
+ * form.  Artificial variable columns (index >= artStart) are skipped since
+ * they are kept blocked by BIG_M in the objective row.
+ */
+static void refactorConstraintColumns(Tableau* tab, const RefactorContext* rfc, int verbose) {
+    LPProblem*    lp              = rfc->lp;
+    const int*    varToConstraint = rfc->varToConstraint;
+    const double* varCoeffSign    = rfc->varCoeffSign;
+    int artStart = rfc->artStart;
+    int nCols = tab->cols;
+    int rhsCol = nCols - 1;
+
+    /* ---- Build augmented matrix [B | I] and reduce to [I | B^{-1}] ---- */
+    /* Row-major; B occupies columns 0..lp->numConstraints-1 and I occupies lp->numConstraints..2*lp->numConstraints-1 */
+    double* work = (double*)calloc(lp->numConstraints * 2 * lp->numConstraints, sizeof(double));
+
+    for (int r = 0; r < lp->numConstraints; r++) {
+        int bv = tab->hostBasicVars[r];
+        /* Column r of B = original column of the r-th basic variable */
+        for (int i = 0; i < lp->numConstraints; i++)
+            work[i * 2*lp->numConstraints + r] = getOrigAij(bv, i, lp, varToConstraint, varCoeffSign);
+        /* Identity block */
+        work[r * 2*lp->numConstraints + lp->numConstraints + r] = 1.0;
+    }
+
+    /* Gauss-Jordan with partial (column) pivoting */
+    for (int col = 0; col < lp->numConstraints; col++) {
+        /* Find the row with the largest absolute value in column col */
+        int prow = col;
+        double best = fabs(work[col * 2*lp->numConstraints + col]);
+        for (int row = col + 1; row < lp->numConstraints; row++) {
+            double v = fabs(work[row * 2*lp->numConstraints + col]);
+            if (v > best) { best = v; prow = row; }
+        }
+        if (best < 1e-12) {
+            /* Near-singular basis — skip this refactorization cycle */
+            if (verbose >= 2)
+                printf("[DIAG] Refactorization skipped: near-singular basis (col %d, pivot=%.2e)\n",
+                       col, best);
+            free(work);
+            return;
+        }
+        /* Swap rows prow <-> col */
+        if (prow != col) {
+            for (int j = 0; j < 2*lp->numConstraints; j++) {
+                double tmp = work[col  * 2*lp->numConstraints + j];
+                work[col  * 2*lp->numConstraints + j] = work[prow * 2*lp->numConstraints + j];
+                work[prow * 2*lp->numConstraints + j] = tmp;
+            }
+        }
+        /* Normalise pivot row */
+        double piv = work[col * 2*lp->numConstraints + col];
+        for (int j = 0; j < 2*lp->numConstraints; j++) work[col * 2*lp->numConstraints + j] /= piv;
+        /* Eliminate column col from every other row */
+        for (int row = 0; row < lp->numConstraints; row++) {
+            if (row == col) continue;
+            double f = work[row * 2*lp->numConstraints + col];
+            if (fabs(f) < 1e-16) continue;
+            for (int j = 0; j < 2*lp->numConstraints; j++)
+                work[row * 2*lp->numConstraints + j] -= f * work[col * 2*lp->numConstraints + j];
+        }
+    }
+    /* B^{-1} now in work[r * 2*lp->numConstraints + lp->numConstraints + k] for row r, column k */
+
+    /* ---- Restore tableau from fresh B^{-1} ---- */
+    int* isBasicVar = (int*)calloc(nCols, sizeof(int));
+    for (int r = 0; r < lp->numConstraints; r++) isBasicVar[tab->hostBasicVars[r]] = 1;
+
+    /* Restore basic-variable columns to canonical identity */
+    for (int r = 0; r < lp->numConstraints; r++) {
+        int bv = tab->hostBasicVars[r];
+        for (int r2 = 0; r2 < lp->numConstraints; r2++)
+            tab->hostData[(r2 + 1) * nCols + bv] = (r2 == r) ? 1.0 : 0.0;
+    }
+
+    /* Re-derive non-basic original and slack/surplus columns (skip artificials) */
+    for (int j = 0; j < artStart; j++) {
+        if (isBasicVar[j]) continue;
+        for (int r = 0; r < lp->numConstraints; r++) {
+            double val = 0.0;
+            for (int k = 0; k < lp->numConstraints; k++)
+                val += work[r * 2*lp->numConstraints + lp->numConstraints + k] *
+                       getOrigAij(j, k, lp, varToConstraint, varCoeffSign);
+            tab->hostData[(r + 1) * nCols + j] = val;
+        }
+    }
+
+    /* Re-derive RHS as B^{-1} * b_original and restore basic-variable
+     * column identity — but DO NOT add any perturbation here.  The existing
+     * RHS perturbation state from Phase 2 setup carries through pivot
+     * operations naturally and must not be reset, otherwise the anti-cycling
+     * guarantee is broken. */
+    for (int r = 0; r < lp->numConstraints; r++) {
+        double val = 0.0;
+        for (int k = 0; k < lp->numConstraints; k++)
+            val += work[r * 2*lp->numConstraints + lp->numConstraints + k] * lp->rhs[k];
+        /* Keep the accumulated RHS from the current tableau; only use the
+         * fresh value to clamp obviously-wrong large negatives caused by
+         * numerical blowup (threshold: 10x the original b range). */
+        double cur = tab->hostData[(r + 1) * nCols + rhsCol];
+        double freshVal = (val < 0.0) ? 0.0 : val;
+        /* If accumulated value is reasonably close to fresh, keep it.
+         * If it has drifted badly (wrong sign or extreme magnitude), correct. */
+        double bMax = 0.0;
+        for (int k = 0; k < lp->numConstraints; k++) if (lp->rhs[k] > bMax) bMax = lp->rhs[k];
+        if (cur < -1.0 || cur > freshVal + bMax * 10.0 + 1.0)
+            tab->hostData[(r + 1) * nCols + rhsCol] = freshVal;
+    }
+
+    free(isBasicVar);
+    free(work);
+
+    if (verbose >= 2) printf("[DIAG] Full basis refactorization completed (Gauss-Jordan)\n");
+
+    CUDA_CHECK(cudaMemcpy(tab->data, tab->hostData,
+                          tab->rows * nCols * sizeof(double), cudaMemcpyHostToDevice));
+}
+
 /**
  * Run one phase of the simplex algorithm
  * Returns: OPTIMAL, UNBOUNDED, or ERROR
@@ -551,8 +692,10 @@ void rederiveObjectiveRow(Tableau* tab, const double* phaseCosts, int blockArt) 
  * @param phaseCosts  Cost vector for the current phase (size: tab->cols).
  *                    Used for periodic objective row re-derivation.
  *                    Pass NULL to disable re-derivation (not recommended).
+ * @param rfc         If non-NULL, enables periodic constraint column refactorization
+ *                    every REFACTOR_COL_INTERVAL iterations (Phase 2 only).
  */
-SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* phaseCosts, int blockArt, SolverConfig* config, RunContext* run) {
+SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* phaseCosts, int blockArt, SolverConfig* config, RunContext* run, const RefactorContext* rfc) {
     // Allocate device memory for kernel outputs
     double *d_minVal, *d_minRatio;
     int *d_pivotCol, *d_pivotRow;
@@ -580,18 +723,18 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* pha
     int cacheBlocks = (maxDim + BLOCK_SIZE - 1) / BLOCK_SIZE;
     
     // Print the initial tableau before any pivoting
-    if (g_debug) printTableauStep(tab, 0, -1, -1);
+    if (config->debug) printTableauStep(tab, 0, -1, -1);
     
     while (iteration < maxIterations) {
         iteration++;
         
         // Check timeout
-        if (g_timeout > 0.0) {
+        if (config->timeout > 0.0) {
             double now = hpc_gettime();
-            if (now - g_solveStartTime >= g_timeout) {
-                if (g_verbose)
+            if (now - run->solveStartTime >= config->timeout) {
+                if (config->verbose)
                     printf("Timeout after %.2f seconds at iteration %d\n",
-                           now - g_solveStartTime, iteration);
+                           now - run->solveStartTime, iteration);
                 status = TIMEOUT;
                 break;
             }
@@ -611,10 +754,10 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* pha
         
         // Check for optimality
         if (h_pivotCol < 0) {
-            if (g_verbose == 1)
+            if (config->verbose == 1)
                 printf("Iteration %d: Optimal solution found (min reduced cost: %.6f)\n", 
                        iteration, h_minVal);
-            if (g_verbose >= 2)
+            if (config->verbose >= 2)
                 printf("[DIAG] Phase converged after %d iterations (min reduced cost: %.10e)\n",
                        iteration, h_minVal);
             status = OPTIMAL;
@@ -670,7 +813,7 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* pha
                     h_pivotRow = bestRow;
                     h_minRatio = bestRatio;
                     recovered = 1;
-                    if (g_verbose >= 2 && (iteration % 200 == 0))
+                    if (config->verbose >= 2 && (iteration % 200 == 0))
                         printf("[DIAG] Recovered pivot at iter %d: row %d, ratio %.6e (neg RHS recovery)\n",
                                iteration, h_pivotRow, h_minRatio);
                 } else {
@@ -680,9 +823,6 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* pha
                     tab->hostData[h_pivotCol] = bigval;
                     CUDA_CHECK(cudaMemcpy(&tab->data[h_pivotCol], &bigval,
                                           sizeof(double), cudaMemcpyHostToDevice));
-                    
-                    // Re-derive objective to get correct costs for other columns
-                    rederiveObjectiveRow(tab, phaseCosts, blockArt);
                     // But keep the blocked column at +inf
                     tab->hostData[h_pivotCol] = bigval;
                     CUDA_CHECK(cudaMemcpy(&tab->data[h_pivotCol], &bigval,
@@ -707,7 +847,7 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* pha
                         
                         if (h_pivotRow >= 0) {
                             recovered = 1;
-                            if (g_verbose >= 2)
+                            if (config->verbose >= 2)
                                 printf("[DIAG] Column skip at iter %d: new pivot col %d, row %d\n",
                                        iteration, h_pivotCol, h_pivotRow);
                         }
@@ -722,10 +862,10 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* pha
             }
             
             if (!recovered) {
-                if (g_verbose == 1)
+                if (config->verbose == 1)
                     printf("Iteration %d: Problem is unbounded (no valid pivot row for column %d)\n",
                            iteration, h_pivotCol);
-                if (g_verbose >= 2) {
+                if (config->verbose >= 2) {
                     printf("[DIAG] UNBOUNDED at iteration %d, pivot col %d, min reduced cost %.10e\n",
                            iteration, h_pivotCol, h_minVal);
                     syncTableauToHost(tab);
@@ -753,7 +893,7 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* pha
             }
         }
         
-        if (g_verbose == 1)
+        if (config->verbose == 1)
             printf("Iteration %d: Pivot at row %d, col %d (ratio: %.6f)\n",
                    iteration, h_pivotRow, h_pivotCol, h_minRatio);
         
@@ -780,28 +920,32 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* pha
         tab->hostBasicVars[constraintIdx] = h_pivotCol;
         
         // Track iteration count and log if enabled
-        g_totalIterations++;
-        if (g_iterLog) {
+        run->totalIterations++;
+        if (config->iterLog) {
             double objRHS;
             CUDA_CHECK(cudaMemcpy(&objRHS, &tab->data[tab->cols - 1], sizeof(double), cudaMemcpyDeviceToHost));
-            fprintf(g_iterLog, "%d,%d,%d,%d,%.10e,%.10e,%.10e\n",
-                    g_totalIterations, g_phase, h_pivotCol, h_pivotRow, h_minVal, h_minRatio, objRHS);
+            fprintf(config->iterLog, "%d,%d,%d,%d,%.10e,%.10e,%.10e\n",
+                    run->totalIterations, run->phase, h_pivotCol, h_pivotRow, h_minVal, h_minRatio, objRHS);
         }
         
-        // Periodic objective row re-derivation to combat numerical drift
+        // Periodic objective row re-derivation, and full constraint column
+        // refactorization every REFACTOR_COL_INTERVAL iterations if context is available.
         if (phaseCosts != NULL && (iteration % REFACTOR_INTERVAL) == 0) {
             syncTableauToHost(tab);
+            if (rfc != NULL && (iteration % REFACTOR_COL_INTERVAL) == 0) {
+                refactorConstraintColumns(tab, rfc, config->verbose);
+            }
             rederiveObjectiveRow(tab, phaseCosts, blockArt);
-            if (g_verbose >= 2 && (iteration % (REFACTOR_INTERVAL * 10)) == 0)
+            if (config->verbose >= 2 && (iteration % (REFACTOR_INTERVAL * 10)) == 0)
                 printf("[DIAG] Re-derived objective row at iteration %d\n", iteration);
         }
         
         // Print tableau after this pivot
-        if (g_debug) printTableauStep(tab, iteration, h_pivotRow, h_pivotCol);
+        if (config->debug) printTableauStep(tab, iteration, h_pivotRow, h_pivotCol);
     }
     
     // Print final tableau in debug mode
-    if (g_debug && iteration > 0) {
+    if (config->debug && iteration > 0) {
         printf("\n>>> Final Tableau (after %d iterations, status: %s)\n",
                iteration, (status == OPTIMAL) ? "OPTIMAL" : "in-progress");
         printTableau(tab);
@@ -827,14 +971,14 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* pha
  * Main two-phase simplex solver
  */
 SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, RunContext* run) {
-    if (g_verbose) printf("\n=== Starting Two-Phase Simplex Method ===\n");
+    if (config->verbose) printf("\n=== Starting Two-Phase Simplex Method ===\n");
     
-    int maxIterations = g_maxIter;
-    g_solveStartTime = hpc_gettime();
+    int maxIterations = config->maxIter;
+    run->solveStartTime = hpc_gettime();
     
     // Check if Phase 1 is needed
     if (tab->numArtificial > 0) {
-        if (g_verbose) printf("\n--- Phase 1: Finding basic feasible solution ---\n");
+        if (config->verbose) printf("\n--- Phase 1: Finding basic feasible solution ---\n");
         
         // Save original objective
         double* originalObjective = (double*)malloc(tab->cols * sizeof(double));
@@ -850,7 +994,7 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
         }
         
         // Diagnostic: check Phase 1 objective row after setup
-        if (g_verbose >= 2) {
+        if (config->verbose >= 2) {
             syncTableauToHost(tab);
             double initPhase1Obj = tab->hostData[tab->cols - 1];
             printf("[DIAG] Phase 1 initial objective (RHS): %.10f\n", initPhase1Obj);
@@ -868,13 +1012,13 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
             printf("[DIAG] Total rows with negative RHS: %d\n", negRHS);
         }
         
-        g_phase = 1;
-        SimplexStatus phase1Status = runSimplexPhase(tab, maxIterations, phase1Costs, 0, config, run);
+        run->phase = 1;
+        SimplexStatus phase1Status = runSimplexPhase(tab, maxIterations, phase1Costs, 0, config, run, NULL);
         free(phase1Costs);
         
         if (phase1Status == UNBOUNDED) {
             printf("Error: Phase 1 should not be unbounded!\n");
-            if (g_verbose >= 2) {
+            if (config->verbose >= 2) {
                 syncTableauToHost(tab);
                 printf("[DIAG] Phase 1 ended UNBOUNDED. Obj row RHS: %.10f\n", tab->hostData[tab->cols - 1]);
             }
@@ -894,11 +1038,11 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
         // Account for symbolic perturbation: tolerance scales with problem size
         double phase1Tol = (double)(tab->rows) * (double)(tab->rows) * PERTURB_EPS + 1e-6;
         
-        if (g_verbose) printf("Phase 1 objective value: %.10f (tolerance: %.6e)\n", phase1Obj, phase1Tol);
+        if (config->verbose) printf("Phase 1 objective value: %.10f (tolerance: %.6e)\n", phase1Obj, phase1Tol);
         
         if (fabs(phase1Obj) > phase1Tol) {
-            if (g_verbose) printf("Problem is INFEASIBLE (Phase 1 objective = %.6f)\n", phase1Obj);
-            if (g_verbose >= 2) {
+            if (config->verbose) printf("Problem is INFEASIBLE (Phase 1 objective = %.6f)\n", phase1Obj);
+            if (config->verbose >= 2) {
                 // Show which artificial vars are still in basis with non-zero values
                 int artStart = tab->numOriginalVars + tab->numSlack;
                 for (int i = 0; i < tab->rows - 1; i++) {
@@ -916,31 +1060,37 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
         
         int extractionStatus = extractArtificialBasis(tab, config);
         if (extractionStatus < 0) {
-            if (g_verbose) printf("Error: Failed to extract degenerate artificial basis\n");
+            if (config->verbose) printf("Error: Failed to extract degenerate artificial basis\n");
             free(originalObjective);
             return ERROR;
         }
-        if (extractionStatus != 0 && g_verbose) {
+        if (extractionStatus != 0 && config->verbose) {
             printf("Artificial basis cleanup completed before Phase 2\n");
         }
         
-        if (g_verbose) printf("\n--- Phase 2: Optimizing original objective ---\n");
-        
+        if (config->verbose) printf("\n--- Phase 2: Optimizing original objective ---\n");
+
+        // Arrays kept alive across the Phase 2 run for periodic column refactorization.
+        // Allocated inside the if-block below; freed after runSimplexPhase returns.
+        int*    rfc_initialBasisCol = NULL;
+        int*    rfc_varToConstraint = NULL;
+        double* rfc_varCoeffSign    = NULL;
+        int     rfc_artStart        = 0;
+
         // Remove symbolic perturbation and optionally re-derive entire tableau before Phase 2
         if ((extractionStatus & 2) == 0) {
             syncTableauToHost(tab);
             int artStart = tab->numOriginalVars + tab->numSlack;
-            int nCons = tab->rows - 1;
             
             // Build mapping: constraint index → initial basis column
             // B^{-1} is stored in the columns of the initial basis variables,
             // which are slack columns for LE constraints and artificial columns
             // for GE/EQ constraints.
-            int* initialBasisCol = (int*)malloc(nCons * sizeof(int));
+            int* initialBasisCol = (int*)malloc(lp->numConstraints * sizeof(int));
             {
                 int sIdx = lp->numVars;
                 int aIdx = artStart;
-                for (int c = 0; c < nCons; c++) {
+                for (int c = 0; c < lp->numConstraints; c++) {
                     if (lp->constraintTypes[c] == CONSTRAINT_LE) {
                         initialBasisCol[c] = sIdx;
                         sIdx++;
@@ -961,7 +1111,7 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
             for (int j = 0; j < tab->cols; j++) { varToConstraint[j] = -1; varCoeffSign[j] = 0.0; }
             {
                 int sIdx = lp->numVars;
-                for (int c = 0; c < nCons; c++) {
+                for (int c = 0; c < lp->numConstraints; c++) {
                     if (lp->constraintTypes[c] == CONSTRAINT_LE) {
                         varToConstraint[sIdx] = c; varCoeffSign[sIdx] = 1.0; sIdx++;
                     } else if (lp->constraintTypes[c] == CONSTRAINT_GE) {
@@ -969,7 +1119,7 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
                     }
                 }
                 int aIdx = artStart;
-                for (int c = 0; c < nCons; c++) {
+                for (int c = 0; c < lp->numConstraints; c++) {
                     if (lp->constraintTypes[c] == CONSTRAINT_GE || lp->constraintTypes[c] == CONSTRAINT_EQ) {
                         varToConstraint[aIdx] = c; varCoeffSign[aIdx] = 1.0; aIdx++;
                     }
@@ -977,9 +1127,9 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
             }
             
             // Step 1: Remove perturbation via B^{-1} * perturbation subtraction
-            for (int r = 0; r < nCons; r++) {
+            for (int r = 0; r < lp->numConstraints; r++) {
                 double correction = 0.0;
-                for (int j = 0; j < nCons; j++) {
+                for (int j = 0; j < lp->numConstraints; j++) {
                     double bij = tab->hostData[(r + 1) * tab->cols + initialBasisCol[j]];
                     correction += bij * (j + 1) * PERTURB_EPS;
                 }
@@ -989,10 +1139,10 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
             // Step 2: Check B^{-1} accuracy via one round of iterative refinement
             double maxCorrection = 0.0;
             {
-                double* residual = (double*)calloc(nCons, sizeof(double));
-                for (int i = 0; i < nCons; i++) {
+                double* residual = (double*)calloc(lp->numConstraints, sizeof(double));
+                for (int i = 0; i < lp->numConstraints; i++) {
                     residual[i] = lp->rhs[i];
-                    for (int r = 0; r < nCons; r++) {
+                    for (int r = 0; r < lp->numConstraints; r++) {
                         int bv = tab->hostBasicVars[r];
                         double xval = tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)];
                         double aij;
@@ -1005,9 +1155,9 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
                     }
                 }
                 
-                for (int r = 0; r < nCons; r++) {
+                for (int r = 0; r < lp->numConstraints; r++) {
                     double corr = 0.0;
-                    for (int j = 0; j < nCons; j++) {
+                    for (int j = 0; j < lp->numConstraints; j++) {
                         double bij = tab->hostData[(r + 1) * tab->cols + initialBasisCol[j]];
                         corr += bij * residual[j];
                     }
@@ -1017,9 +1167,9 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
                 // Only apply corrections if B^{-1} is reasonable
                 if (maxCorrection < 1.0) {
                     // Recompute: apply corrections
-                    for (int r = 0; r < nCons; r++) {
+                    for (int r = 0; r < lp->numConstraints; r++) {
                         double corr = 0.0;
-                        for (int j = 0; j < nCons; j++) {
+                        for (int j = 0; j < lp->numConstraints; j++) {
                             double bij = tab->hostData[(r + 1) * tab->cols + initialBasisCol[j]];
                             corr += bij * residual[j];
                         }
@@ -1028,7 +1178,7 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
                 }
                 free(residual);
                 
-                if (g_verbose >= 2)
+                if (config->verbose >= 2)
                     printf("[DIAG] RHS refinement: max correction = %.6e (%s)\n", 
                            maxCorrection, maxCorrection < 1.0 ? "applied" : "skipped");
             }
@@ -1037,13 +1187,13 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
             if (maxCorrection < 1.0) {
                 // Mark basic variable columns to skip them
                 int* isBasicVar = (int*)calloc(tab->cols, sizeof(int));
-                for (int r = 0; r < nCons; r++) isBasicVar[tab->hostBasicVars[r]] = 1;
+                for (int r = 0; r < lp->numConstraints; r++) isBasicVar[tab->hostBasicVars[r]] = 1;
                 
                 for (int j = 0; j < lp->numVars; j++) {
                     if (isBasicVar[j]) continue;
-                    for (int r = 0; r < nCons; r++) {
+                    for (int r = 0; r < lp->numConstraints; r++) {
                         double val = 0.0;
-                        for (int k = 0; k < nCons; k++) {
+                        for (int k = 0; k < lp->numConstraints; k++) {
                             double bij = tab->hostData[(r + 1) * tab->cols + initialBasisCol[k]];
                             val += bij * lp->constraintMatrix[k][j];
                         }
@@ -1057,7 +1207,7 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
                     int cons = varToConstraint[j];
                     double sign = varCoeffSign[j];
                     if (cons >= 0) {
-                        for (int r = 0; r < nCons; r++) {
+                        for (int r = 0; r < lp->numConstraints; r++) {
                             tab->hostData[(r + 1) * tab->cols + j] = 
                                 sign * tab->hostData[(r + 1) * tab->cols + initialBasisCol[cons]];
                         }
@@ -1065,24 +1215,25 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
                 }
                 
                 free(isBasicVar);
-                if (g_verbose >= 2) printf("[DIAG] Re-derived all constraint columns\n");
+                if (config->verbose >= 2) printf("[DIAG] Re-derived all constraint columns\n");
             }
             
-            free(initialBasisCol);
-            free(varToConstraint);
-            free(varCoeffSign);
-            
-            // Clamp negative RHS to zero
+            // Keep references alive for Phase 2 periodic constraint column refactorization
+            rfc_initialBasisCol = initialBasisCol;
+            rfc_varToConstraint = varToConstraint;
+            rfc_varCoeffSign    = varCoeffSign;
+            rfc_artStart        = artStart;
+
+            // Clamp negative RHS to zero (original behaviour, no Phase-2 perturbation).
             for (int r = 0; r < nCons; r++) {
-                if (tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)] < 0.0) {
-                    tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)] = 0.0;
-                }
+                double* rp = &tab->hostData[(r + 1) * tab->cols + (tab->cols - 1)];
+                if (*rp < 0.0) *rp = 0.0;
             }
             
             CUDA_CHECK(cudaMemcpy(tab->data, tab->hostData,
                                   tab->rows * tab->cols * sizeof(double), cudaMemcpyHostToDevice));
-            if (g_verbose >= 2) printf("[DIAG] Phase 2 tableau prepared\n");
-        } else if (g_verbose >= 2) {
+            if (config->verbose >= 2) printf("[DIAG] Phase 2 tableau prepared\n");
+        } else if (config->verbose >= 2) {
             printf("[DIAG] Skipped B^-1-based Phase 2 preparation after row/column elimination\n");
         }
         
@@ -1105,14 +1256,28 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
 
         free(phase2Objective);
         free(originalObjective);
-        
+
+        // Build RefactorContext for Phase 2 constraint column refactorization
+        RefactorContext rfc_data, *rfc_ptr = NULL;
+        if (rfc_initialBasisCol != NULL) {
+            rfc_data.lp              = lp;
+            rfc_data.initialBasisCol = rfc_initialBasisCol;
+            rfc_data.varToConstraint = rfc_varToConstraint;
+            rfc_data.varCoeffSign    = rfc_varCoeffSign;
+            rfc_data.artStart        = rfc_artStart;
+            rfc_ptr = &rfc_data;
+        }
+
         // Phase 2
-        g_phase = 2;
-        SimplexStatus status = runSimplexPhase(tab, maxIterations, phase2Costs, 1, config, run);
+        run->phase = 2;
+        SimplexStatus status = runSimplexPhase(tab, maxIterations, phase2Costs, 1, config, run, rfc_ptr);
         free(phase2Costs);
+        free(rfc_initialBasisCol);
+        free(rfc_varToConstraint);
+        free(rfc_varCoeffSign);
         return status;
     } else {
-        if (g_verbose) printf("\nNo artificial variables needed - direct optimization\n");
+        if (config->verbose) printf("\nNo artificial variables needed - direct optimization\n");
     }
     
     // Single phase (no artificials) — build cost vector from objective row
@@ -1125,8 +1290,8 @@ SimplexStatus solveSimplex(Tableau* tab, LPProblem* lp, SolverConfig* config, Ru
         phaseCosts[j] = objSign * lp->objCoeffs[j];
     }
     
-    g_phase = 0;
-    SimplexStatus status = runSimplexPhase(tab, maxIterations, phaseCosts, 0, config, run);
+    run->phase = 0;
+    SimplexStatus status = runSimplexPhase(tab, maxIterations, phaseCosts, 0, config, run, NULL);
     free(phaseCosts);
     return status;
 }

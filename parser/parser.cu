@@ -225,6 +225,17 @@ static int isMPSSectionHeader(const char* line) {
     return (line[0] != '\0' && line[0] != ' ' && line[0] != '\t' && line[0] != '*');
 }
 
+/* Identifies the current section while parsing an MPS file. */
+typedef enum {
+    SEC_NONE = 0,
+    SEC_ROWS,
+    SEC_COLUMNS,
+    SEC_RHS,
+    SEC_BOUNDS,
+    SEC_RANGES,
+    SEC_UNKNOWN   /* unrecognised section — data lines are silently skipped */
+} MpsSection;
+
 /**
  * Parse an MPS file into an LPProblem.
  *
@@ -244,7 +255,7 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
     lp->objConstant = 0.0;
     
     char rawLine[MPS_LINE_BUF_SIZE];
-    char section[64] = "";
+    MpsSection section = SEC_NONE;
     
     // --- Dynamic storage for rows ---
     int rowCap = MPS_INIT_ROW_CAP;
@@ -391,11 +402,11 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
                 }
                 continue;
             }
-            if (strncmp(rawLine, "ROWS", 4) == 0)     { strcpy(section, "ROWS"); continue; }
-            if (strncmp(rawLine, "COLUMNS", 7) == 0)   { strcpy(section, "COLUMNS"); continue; }
-            if (strncmp(rawLine, "RHS", 3) == 0)       { strcpy(section, "RHS"); continue; }
-            if (strncmp(rawLine, "BOUNDS", 6) == 0)     { strcpy(section, "BOUNDS"); continue; }
-            if (strncmp(rawLine, "RANGES", 6) == 0)     { strcpy(section, "RANGES"); continue; }
+            if (strncmp(rawLine, "ROWS", 4) == 0)     { section = SEC_ROWS;    continue; }
+            if (strncmp(rawLine, "COLUMNS", 7) == 0)   { section = SEC_COLUMNS; continue; }
+            if (strncmp(rawLine, "RHS", 3) == 0)       { section = SEC_RHS;     continue; }
+            if (strncmp(rawLine, "BOUNDS", 6) == 0)    { section = SEC_BOUNDS;  continue; }
+            if (strncmp(rawLine, "RANGES", 6) == 0)    { section = SEC_RANGES;  continue; }
             if (strncmp(rawLine, "ENDATA", 6) == 0)     break;  // *** STOP parsing ***
             if (strncmp(rawLine, "OBJSENSE", 8) == 0) {
                 if (fgets(rawLine, MPS_LINE_BUF_SIZE, file)) {
@@ -409,8 +420,8 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
                 }
                 continue;
             }
-            // Unknown section — record name and skip its data lines
-            extractMPSField(rawLine, 0, 15, section, sizeof(section));
+            // Unknown section — skip its data lines
+            section = SEC_UNKNOWN;
             continue;
         }
         
@@ -424,7 +435,7 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
         //   Field 6: cols 49-60  (value 2, 12 chars)
         
         // ---- ROWS section ----
-        if (strcmp(section, "ROWS") == 0) {
+        if (section == SEC_ROWS) {
             char typeField[4], nameField[64];
             extractMPSField(rawLine, MPS_F1_START, MPS_F1_END, typeField, sizeof(typeField));
             extractMPSField(rawLine, MPS_F2_START, MPS_F2_END, nameField, sizeof(nameField));
@@ -459,7 +470,7 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
             }
         }
         // ---- COLUMNS section ----
-        else if (strcmp(section, "COLUMNS") == 0) {
+        else if (section == SEC_COLUMNS) {
             char field2[64], field3[64], field4[64], field5[64], field6[64];
             extractMPSField(rawLine, MPS_F2_START, MPS_F2_END, field2, sizeof(field2));  // column name
             extractMPSField(rawLine, MPS_F3_START, MPS_F3_END, field3, sizeof(field3));  // row name 1
@@ -511,7 +522,7 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
             }
         }
         // ---- RHS section ----
-        else if (strcmp(section, "RHS") == 0) {
+        else if (section == SEC_RHS) {
             char field2[64], field3[64], field4[64], field5[64], field6[64];
             extractMPSField(rawLine, MPS_F2_START, MPS_F2_END, field2, sizeof(field2));
             extractMPSField(rawLine, MPS_F3_START, MPS_F3_END, field3, sizeof(field3));
@@ -541,7 +552,7 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
             }
         }
         // ---- BOUNDS section ----
-        else if (strcmp(section, "BOUNDS") == 0) {
+        else if (section == SEC_BOUNDS) {
             // Field 1 (cols 1-2): bound type  (LO, UP, FX, FR, MI, PL, BV, LI, UI)
             // Field 2 (cols 4-11): bound set name
             // Field 3 (cols 14-21): variable name
@@ -594,7 +605,7 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
             }
         }
         // ---- RANGES section ----
-        else if (strcmp(section, "RANGES") == 0) {
+        else if (section == SEC_RANGES) {
             // Same field layout as RHS: name, row, value [, row, value]
             char field2[64], field3[64], field4[64], field5[64], field6[64];
             extractMPSField(rawLine, MPS_F2_START, MPS_F2_END, field2, sizeof(field2));
@@ -625,27 +636,41 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
     lp->numVars = numVars;
     lp->numConstraints = numRows;
     
+    // All pointer arrays use calloc so that uninitialized entries are NULL;
+    // this makes freeLPProblem safe to call from the cleanup path even if
+    // we jump there before fully populating every row/variable slot.
     lp->objCoeffs = (double*)malloc(numVars * sizeof(double));
+    if (!lp->objCoeffs) goto cleanup;
     memcpy(lp->objCoeffs, objCoeffsTemp, numVars * sizeof(double));
-    
+
     lp->lowerBounds = (double*)malloc(numVars * sizeof(double));
+    if (!lp->lowerBounds) goto cleanup;
     memcpy(lp->lowerBounds, loBounds, numVars * sizeof(double));
-    
+
     lp->upperBounds = (double*)malloc(numVars * sizeof(double));
+    if (!lp->upperBounds) goto cleanup;
     memcpy(lp->upperBounds, upBounds, numVars * sizeof(double));
-    
+
     lp->isInteger = (int*)malloc(numVars * sizeof(int));
+    if (!lp->isInteger) goto cleanup;
     memcpy(lp->isInteger, isInt, numVars * sizeof(int));
-    
+
     lp->rhs = (double*)malloc(numRows * sizeof(double));
+    if (!lp->rhs) goto cleanup;
     lp->constraintTypes = (ConstraintType*)malloc(numRows * sizeof(ConstraintType));
-    lp->constraintMatrix = (double**)malloc(numRows * sizeof(double*));
-    lp->varNames = (char**)calloc(numVars, sizeof(char*));  // calloc ensures NULL sentinels for freeLPProblem
-    lp->constraintNames = (char**)malloc(numRows * sizeof(char*));
+    if (!lp->constraintTypes) goto cleanup;
+    lp->constraintMatrix = (double**)calloc(numRows, sizeof(double*));
+    if (!lp->constraintMatrix) goto cleanup;
+    lp->varNames = (char**)calloc(numVars, sizeof(char*));
+    if (!lp->varNames) goto cleanup;
+    lp->constraintNames = (char**)calloc(numRows, sizeof(char*));
+    if (!lp->constraintNames) goto cleanup;
     lp->rangeValues = (double*)malloc(numRows * sizeof(double));
-    
+    if (!lp->rangeValues) goto cleanup;
+
     for (int i = 0; i < numRows; i++) {
         lp->constraintMatrix[i] = (double*)calloc(numVars, sizeof(double));
+        if (!lp->constraintMatrix[i]) goto cleanup;
         lp->rhs[i] = rhsValues[i];
         lp->constraintTypes[i] = rowTypes[i];
         lp->constraintNames[i] = rowNames[i];   // Transfer ownership
