@@ -4,7 +4,7 @@ This pass revisits every finding above and deepens the description of *why* it i
 
 ---
 
-### A. DRY Violation — Duplicated `hasFileExtensionIgnoreCase`
+### A. DRY Violation — Duplicated `hasFileExtensionIgnoreCase` - Fixed
 
 **Detail**: The two copies live in modules with different responsibilities: `parser.cu` uses it to route to `parseDAT` vs `parseMPS`, while `app.cu` uses it for the interactive-mode file check and the batch directory filter (`isSupportedInputFile`). Because each copy is `static`, neither is visible to the other translation unit — there is no shared declaration and no linker-level duplication warning to catch a divergence. The duplication is therefore invisible to the build system.
 
@@ -12,7 +12,7 @@ The risk is latent but concrete: if the case-folding logic ever needs to be chan
 
 ---
 
-### B. Magic Number — `1e20` Big-M Constant
+### B. Magic Number — `1e20` Big-M Constant - Fixed
 
 **Detail**: The three sites where `1e20` appears are:
 1. `setupPhase2` — setting non-basic artificial columns to a large cost after restoring the Phase 2 objective.
@@ -23,7 +23,7 @@ There is no documentation at any of these sites that explains the choice of `1e2
 
 ---
 
-### C. Magic Numbers — Hardcoded Buffer and Capacity Sizes
+### C. Magic Numbers — Hardcoded Buffer and Capacity Sizes - Fixed
 
 **Detail**:
 
@@ -37,7 +37,7 @@ There is no documentation at any of these sites that explains the choice of `1e2
 
 ---
 
-### D. Magic Numbers — Hardcoded MPS Field Column Offsets
+### D. Magic Numbers — Hardcoded MPS Field Column Offsets - Fixed
 
 **Detail**: The MPS fixed-column format offsets are used as raw integers in eight `extractMPSField` calls per section, and the same six-field pattern is repeated in four sections (COLUMNS, RHS, BOUNDS, RANGES). That is 24 call sites all containing the same six pairs of numbers.
 
