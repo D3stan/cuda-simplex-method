@@ -1,0 +1,19 @@
+****************************************************************************
+*                      Ricerca Operativa (01/06/2010)                      *
+****************************************************************************
+*******               Risultati dei Problemi di Lineare              *******
+****************************************************************************
+
+1) Soluzioni dei Problemi di Programmazione Lineare:
+
+Nome Problema        Colonne     Righe        Costo Soluzione
+
+LP5.DAT                  700        50              184.02
+LP6.DAT                  700        50              130.19
+LP11.DAT                 800       170             1402.70
+LP20.DAT                 200        70            -9367.30
+LP21.DAT                1000       100           Illimitata
+LP22.DAT                 700        50              -23.40
+LP23.DAT                 700        50              177.40
+AFIRO.DAT                 32        27             -467.65
+BLEND.DAT                 83        74              -27.78
