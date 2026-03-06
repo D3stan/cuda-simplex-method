@@ -101,7 +101,7 @@ The batch mode inner loop is ~100 lines long and resides directly inside `runApp
 
 ---
 
-### I. Missing Error Handling — `realloc` Without NULL Check
+### I. Missing Error Handling — `realloc` Without NULL Check - Fixed
 
 **Detail**: The C standard specifies that `realloc` returns NULL on failure and that the original pointer remains valid and unchanged. The `growVarArrays` lambda performs:
 
@@ -117,7 +117,7 @@ If the second `realloc` fails and returns NULL, `objCoeffsTemp` becomes NULL whi
 
 ---
 
-### J. Missing Error Handling — `strdup` Without NULL Check
+### J. Missing Error Handling — `strdup` Without NULL Check - Fixed
 
 **Detail**: `strdup` calls `malloc` internally and returns NULL on allocation failure. In `parseMPS`, the two most critical callsites are:
 
@@ -128,7 +128,7 @@ Neither of these are hypothetical: on any system under memory pressure, allocati
 
 ---
 
-### K. Memory Leak — Batch Mode Early Exit
+### K. Memory Leak — Batch Mode Early Exit - Fixed
 
 **Detail**: The allocation sequence in `runApp` is:
 
