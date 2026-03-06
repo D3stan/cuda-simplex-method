@@ -11,7 +11,7 @@
  * Returns the exit code (0 = OPTIMAL, 1 = other).
  */
 int solveFile(const char* filename, cudaDeviceProp* prop, SolverConfig* config, RunContext* run) {
-    LPProblem* lp = parseMPS(filename, config);
+    LPProblem* lp = parseLP(filename, config);
     if (!lp) return EXIT_FAILURE;
     
     preprocessBounds(lp, config);
@@ -298,7 +298,7 @@ int runApp(int argc, char* argv[]) {
             const char* base = strrchr(inputFiles[f], '/');
             const char* displayName = base ? base + 1 : inputFiles[f];
             
-            LPProblem* lp = parseMPS(inputFiles[f], &config);
+            LPProblem* lp = parseLP(inputFiles[f], &config);
             if (!lp) {
                 snprintf(results[resultCount].filename, sizeof(results[resultCount].filename),
                          "%s", displayName);
@@ -376,7 +376,7 @@ int runApp(int argc, char* argv[]) {
         if (inputCount > 0) {
             if (config.verbose && config.outputFormat == OUTPUT_TEXT)
                 printf("Loading problem from: %s\n\n", inputFiles[0]);
-            lp = parseMPS(inputFiles[0], &config);
+            lp = parseLP(inputFiles[0], &config);
             if (!lp) {
                 if (config.iterLog) fclose(config.iterLog);
                 free((void*)inputFiles);

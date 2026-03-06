@@ -149,6 +149,13 @@ static LPProblem* parseDAT(const char* filename, const SolverConfig* config) {
     return lp;
 }
 
+LPProblem* parseLP(const char* filename, const SolverConfig* config) {
+    if (hasFileExtensionIgnoreCase(filename, ".dat")) {
+        return parseDAT(filename, config);
+    }
+    return parseMPS(filename, config);
+}
+
 // Strip trailing newline/CR only (preserve column positions for fixed-format)
 static void stripNewline(char* str) {
     int len = (int)strlen(str);
@@ -199,10 +206,6 @@ static int isMPSSectionHeader(const char* line) {
  * Stops strictly at ENDATA.
  */
 LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
-    if (hasFileExtensionIgnoreCase(filename, ".dat")) {
-        return parseDAT(filename, config);
-    }
-
     FILE* file = fopen(filename, "r");
     if (!file) {
         fprintf(stderr, "Error: Cannot open file %s\n", filename);
