@@ -154,6 +154,18 @@ void printUsage(const char* progName) {
     fprintf(stderr, "  %s --log iter.csv problem.dat\n", progName);
 }
 
+/* Free the inputFiles array and any heap-allocated entries within it.
+ * owned[i] == 1 means inputFiles[i] was malloc'd during directory expansion.
+ * When owned == NULL (non-batch paths) only the array itself is freed. */
+static void freeInputFiles(const char** files, int* owned, int count) {
+    if (!files) return;
+    if (owned) {
+        for (int i = 0; i < count; i++)
+            if (owned[i]) free((void*)files[i]);
+        free(owned);
+    }
+    free((void*)files);
+}
 
 int runApp(int argc, char* argv[]) {
     SolverConfig config = {1, OUTPUT_TEXT, NULL, 0, 50000, 0.0};
@@ -165,6 +177,7 @@ int runApp(int argc, char* argv[]) {
     const char* logFile = NULL;
     int inputCount = 0;
     const char** inputFiles = (const char**)malloc(argc * sizeof(const char*));
+    int* expandedOwned = NULL;  // parallel ownership flags for batch-expanded entries
     
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--silent") == 0) {
@@ -178,18 +191,18 @@ int runApp(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--max-iter") == 0) {
             if (i + 1 < argc) {
                 config.maxIter = atoi(argv[++i]);
-                if (config.maxIter <= 0) { fprintf(stderr, "Error: --max-iter must be positive\n"); free(inputFiles); return EXIT_FAILURE; }
+                if (config.maxIter <= 0) { fprintf(stderr, "Error: --max-iter must be positive\n"); freeInputFiles(inputFiles, expandedOwned, inputCount); return EXIT_FAILURE; }
             } else {
                 fprintf(stderr, "Error: --max-iter requires an integer argument\n");
-                free(inputFiles); return EXIT_FAILURE;
+                freeInputFiles(inputFiles, expandedOwned, inputCount); return EXIT_FAILURE;
             }
         } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--timeout") == 0) {
             if (i + 1 < argc) {
                 config.timeout = atof(argv[++i]);
-                if (config.timeout < 0.0) { fprintf(stderr, "Error: --timeout must be non-negative\n"); free(inputFiles); return EXIT_FAILURE; }
+                if (config.timeout < 0.0) { fprintf(stderr, "Error: --timeout must be non-negative\n"); freeInputFiles(inputFiles, expandedOwned, inputCount); return EXIT_FAILURE; }
             } else {
                 fprintf(stderr, "Error: --timeout requires a numeric argument\n");
-                free(inputFiles); return EXIT_FAILURE;
+                freeInputFiles(inputFiles, expandedOwned, inputCount); return EXIT_FAILURE;
             }
         } else if (strcmp(argv[i], "--json") == 0) {
             config.outputFormat = OUTPUT_JSON;
@@ -202,19 +215,19 @@ int runApp(int argc, char* argv[]) {
                 logFile = argv[++i];
             } else {
                 fprintf(stderr, "Error: --log requires a filename argument\n");
-                free(inputFiles);
+                freeInputFiles(inputFiles, expandedOwned, inputCount);
                 return EXIT_FAILURE;
             }
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printUsage(argv[0]);
-            free(inputFiles);
+            freeInputFiles(inputFiles, expandedOwned, inputCount);
             return EXIT_SUCCESS;
         } else if (argv[i][0] != '-') {
             inputFiles[inputCount++] = argv[i];
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             printUsage(argv[0]);
-            free(inputFiles);
+            freeInputFiles(inputFiles, expandedOwned, inputCount);
             return EXIT_FAILURE;
         }
     }
@@ -223,6 +236,7 @@ int runApp(int argc, char* argv[]) {
     if (batchMode) {
         int expandedCount = 0;
         const char** expandedFiles = (const char**)malloc(MAX_BATCH_FILES * sizeof(const char*));
+        expandedOwned = (int*)calloc(MAX_BATCH_FILES, sizeof(int));
         
         for (int i = 0; i < inputCount; i++) {
             struct stat st;
@@ -232,15 +246,25 @@ int runApp(int argc, char* argv[]) {
                     struct dirent* entry;
                     while ((entry = readdir(dir)) != NULL) {
                         if (isSupportedInputFile(entry->d_name)) {
+                            if (expandedCount >= MAX_BATCH_FILES) {
+                                fprintf(stderr, "Warning: batch file limit (%d) reached; skipping '%s/%s'.\n",
+                                        MAX_BATCH_FILES, inputFiles[i], entry->d_name);
+                                continue;
+                            }
                             char* fullpath = (char*)malloc(MAX_PATH_BUF_SIZE);
                             snprintf(fullpath, MAX_PATH_BUF_SIZE, "%s/%s", inputFiles[i], entry->d_name);
+                            expandedOwned[expandedCount] = 1;   // this entry is heap-allocated
                             expandedFiles[expandedCount++] = fullpath;
                         }
                     }
                     closedir(dir);
                 }
             } else {
-                expandedFiles[expandedCount++] = inputFiles[i];
+                if (expandedCount < MAX_BATCH_FILES)
+                    expandedFiles[expandedCount++] = inputFiles[i];
+                else
+                    fprintf(stderr, "Warning: batch file limit (%d) reached; skipping '%s'.\n",
+                            MAX_BATCH_FILES, inputFiles[i]);
             }
         }
         
@@ -254,7 +278,7 @@ int runApp(int argc, char* argv[]) {
         config.iterLog = fopen(logFile, "w");
         if (!config.iterLog) {
             fprintf(stderr, "Error: Cannot open log file %s\n", logFile);
-            free((void*)inputFiles);
+            freeInputFiles(inputFiles, expandedOwned, inputCount);
             return EXIT_FAILURE;
         }
         fprintf(config.iterLog, "iter,phase,pivot_col,pivot_row,reduced_cost,ratio,obj_rhs\n");
@@ -271,7 +295,7 @@ int runApp(int argc, char* argv[]) {
     if (deviceCount == 0) {
         fprintf(stderr, "Error: No CUDA-capable device found!\n");
         if (config.iterLog) fclose(config.iterLog);
-        free((void*)inputFiles);
+        freeInputFiles(inputFiles, expandedOwned, inputCount);
         return EXIT_FAILURE;
     }
     
@@ -288,7 +312,7 @@ int runApp(int argc, char* argv[]) {
     if (interactiveFlag) {
         interactiveMode(&prop, &config, &run);
         if (config.iterLog) fclose(config.iterLog);
-        free((void*)inputFiles);
+        freeInputFiles(inputFiles, expandedOwned, inputCount);
         return EXIT_SUCCESS;
     }
     
@@ -386,7 +410,7 @@ int runApp(int argc, char* argv[]) {
             lp = parseLP(inputFiles[0], &config);
             if (!lp) {
                 if (config.iterLog) fclose(config.iterLog);
-                free((void*)inputFiles);
+                freeInputFiles(inputFiles, expandedOwned, inputCount);
                 return EXIT_FAILURE;
             }
         } else {
@@ -435,7 +459,7 @@ int runApp(int argc, char* argv[]) {
     
     // Final cleanup
     if (config.iterLog) fclose(config.iterLog);
-    free((void*)inputFiles);
+    freeInputFiles(inputFiles, expandedOwned, inputCount);
     
     return exitCode;
 }

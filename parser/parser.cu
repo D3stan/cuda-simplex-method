@@ -276,34 +276,56 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
     int inIntegerBlock = 0;
     
     // --- Helper: grow variable arrays when capacity is exceeded ---
-    auto growVarArrays = [&]() {
+    // Returns 1 on success, 0 if any realloc fails (original pointers remain valid at oldCap).
+    auto growVarArrays = [&]() -> int {
         int oldCap = varCap;
         varCap *= 2;
-        varNamesBuf   = (VarName*)realloc(varNamesBuf, varCap * sizeof(VarName));
-        objCoeffsTemp = (double*)realloc(objCoeffsTemp, varCap * sizeof(double));
-        loBounds      = (double*)realloc(loBounds, varCap * sizeof(double));
-        upBounds      = (double*)realloc(upBounds, varCap * sizeof(double));
-        isInt         = (int*)realloc(isInt, varCap * sizeof(int));
+        VarName* t1 = (VarName*)realloc(varNamesBuf,   varCap * sizeof(VarName));
+        if (!t1) { varCap = oldCap; return 0; }
+        varNamesBuf = t1;
+        double* t2 = (double*)realloc(objCoeffsTemp, varCap * sizeof(double));
+        if (!t2) { varCap = oldCap; return 0; }
+        objCoeffsTemp = t2;
+        double* t3 = (double*)realloc(loBounds, varCap * sizeof(double));
+        if (!t3) { varCap = oldCap; return 0; }
+        loBounds = t3;
+        double* t4 = (double*)realloc(upBounds, varCap * sizeof(double));
+        if (!t4) { varCap = oldCap; return 0; }
+        upBounds = t4;
+        int* t5 = (int*)realloc(isInt, varCap * sizeof(int));
+        if (!t5) { varCap = oldCap; return 0; }
+        isInt = t5;
         for (int i = oldCap; i < varCap; i++) {
             objCoeffsTemp[i] = 0.0;
             loBounds[i] = 0.0;
             upBounds[i] = DBL_MAX;
             isInt[i] = 0;
         }
+        return 1;
     };
     
     // --- Helper: grow row arrays when capacity is exceeded ---
-    auto growRowArrays = [&]() {
+    // Returns 1 on success, 0 if any realloc fails (original pointers remain valid at oldCap).
+    auto growRowArrays = [&]() -> int {
         int oldCap = rowCap;
         rowCap *= 2;
-        rowNames  = (char**)realloc(rowNames, rowCap * sizeof(char*));
-        rowTypes  = (ConstraintType*)realloc(rowTypes, rowCap * sizeof(ConstraintType));
-        rhsValues = (double*)realloc(rhsValues, rowCap * sizeof(double));
-        rangeVals = (double*)realloc(rangeVals, rowCap * sizeof(double));
+        char** t1 = (char**)realloc(rowNames, rowCap * sizeof(char*));
+        if (!t1) { rowCap = oldCap; return 0; }
+        rowNames = t1;
+        ConstraintType* t2 = (ConstraintType*)realloc(rowTypes, rowCap * sizeof(ConstraintType));
+        if (!t2) { rowCap = oldCap; return 0; }
+        rowTypes = t2;
+        double* t3 = (double*)realloc(rhsValues, rowCap * sizeof(double));
+        if (!t3) { rowCap = oldCap; return 0; }
+        rhsValues = t3;
+        double* t4 = (double*)realloc(rangeVals, rowCap * sizeof(double));
+        if (!t4) { rowCap = oldCap; return 0; }
+        rangeVals = t4;
         for (int i = oldCap; i < rowCap; i++) {
             rhsValues[i] = 0.0;
             rangeVals[i] = 0.0;
         }
+        return 1;
     };
     
     // --- Helper: find variable index by name ---
@@ -314,9 +336,9 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
         return -1;
     };
     
-    // --- Helper: add a new variable, returns its index ---
+    // --- Helper: add a new variable, returns its index, or -1 on allocation failure ---
     auto addVar = [&](const char* name) -> int {
-        if (numVars >= varCap) growVarArrays();
+        if (numVars >= varCap && !growVarArrays()) return -1;
         strncpy(varNamesBuf[numVars].name, name, 63);
         varNamesBuf[numVars].name[63] = '\0';
         objCoeffsTemp[numVars] = 0.0;
@@ -336,15 +358,20 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
     };
     
     // --- Helper: add a sparse coefficient entry ---
-    auto addCoeff = [&](int row, int col, double val) {
+    // Returns 1 on success, 0 if realloc fails.
+    auto addCoeff = [&](int row, int col, double val) -> int {
         if (numCoeffs >= coeffCap) {
-            coeffCap *= 2;
-            coeffs = (CoeffEntry*)realloc(coeffs, coeffCap * sizeof(CoeffEntry));
+            int newCap = coeffCap * 2;
+            CoeffEntry* tmp = (CoeffEntry*)realloc(coeffs, newCap * sizeof(CoeffEntry));
+            if (!tmp) return 0;
+            coeffs = tmp;
+            coeffCap = newCap;
         }
         coeffs[numCoeffs].row = row;
         coeffs[numCoeffs].col = col;
         coeffs[numCoeffs].value = val;
         numCoeffs++;
+        return 1;
     };
     
     // ===================== MAIN PARSE LOOP =====================
@@ -409,14 +436,16 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
                 // Only the first N row is used as the objective (per MPS convention)
                 if (!objRowName) {
                     objRowName = strdup(nameField);
+                    if (!objRowName) goto cleanup;
                 } else {
                     fprintf(stderr, "Warning: Multiple N rows found. "
                             "Using '%s' as objective, ignoring '%s'.\n",
                             objRowName, nameField);
                 }
             } else {
-                if (numRows >= rowCap) growRowArrays();
+                if (numRows >= rowCap && !growRowArrays()) goto cleanup;
                 rowNames[numRows] = strdup(nameField);
+                if (!rowNames[numRows]) goto cleanup;
                 switch (type) {
                     case 'L': rowTypes[numRows] = CONSTRAINT_LE; break;
                     case 'G': rowTypes[numRows] = CONSTRAINT_GE; break;
@@ -457,14 +486,17 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
             
             // Find or create variable
             int varIdx = findVar(field2);
-            if (varIdx < 0) varIdx = addVar(field2);
+            if (varIdx < 0) {
+                varIdx = addVar(field2);
+                if (varIdx < 0) goto cleanup;
+            }
             
             // First coefficient
             int rowIdx = findRow(field3);
             if (rowIdx == -1) {
                 objCoeffsTemp[varIdx] = val1;           // Objective
             } else if (rowIdx >= 0) {
-                addCoeff(rowIdx, varIdx, val1);         // Constraint
+                if (!addCoeff(rowIdx, varIdx, val1)) goto cleanup;
             }
             
             // Second coefficient (fields 5+6, optional)
@@ -474,7 +506,7 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
                 if (rowIdx == -1) {
                     objCoeffsTemp[varIdx] = val2;
                 } else if (rowIdx >= 0) {
-                    addCoeff(rowIdx, varIdx, val2);
+                    if (!addCoeff(rowIdx, varIdx, val2)) goto cleanup;
                 }
             }
         }
@@ -587,6 +619,7 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
     }
     
     fclose(file);
+    file = NULL;
     
     // ===================== BUILD LPProblem STRUCTURE =====================
     lp->numVars = numVars;
@@ -607,7 +640,7 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
     lp->rhs = (double*)malloc(numRows * sizeof(double));
     lp->constraintTypes = (ConstraintType*)malloc(numRows * sizeof(ConstraintType));
     lp->constraintMatrix = (double**)malloc(numRows * sizeof(double*));
-    lp->varNames = (char**)malloc(numVars * sizeof(char*));
+    lp->varNames = (char**)calloc(numVars, sizeof(char*));  // calloc ensures NULL sentinels for freeLPProblem
     lp->constraintNames = (char**)malloc(numRows * sizeof(char*));
     lp->rangeValues = (double*)malloc(numRows * sizeof(double));
     
@@ -621,6 +654,7 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
     
     for (int i = 0; i < numVars; i++) {
         lp->varNames[i] = strdup(varNamesBuf[i].name);
+        if (!lp->varNames[i]) goto cleanup;
     }
     
     // Fill constraint matrix from sparse coefficients
@@ -651,6 +685,24 @@ LPProblem* parseMPS(const char* filename, const SolverConfig* config) {
     }
     
     return lp;
+
+cleanup:
+    if (file) fclose(file);
+    free(rangeVals);
+    free(rhsValues);
+    free(coeffs);
+    free(isInt);
+    free(upBounds);
+    free(loBounds);
+    free(objCoeffsTemp);
+    free(varNamesBuf);
+    free(rowTypes);
+    // Free row names not yet transferred to lp (freeLPProblem handles lp->constraintNames[0..numConstraints-1])
+    for (int i = lp->numConstraints; i < numRows; i++) free(rowNames[i]);
+    free(rowNames);
+    free(objRowName);
+    freeLPProblem(lp);
+    return NULL;
 }
 
 /**
