@@ -471,6 +471,17 @@ int runApp(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
+    /* Auto-enable batch mode if any input argument is a directory */
+    if (!batchMode) {
+        for (int i = 0; i < inputCount; i++) {
+            struct stat st;
+            if (stat(inputFiles[i], &st) == 0 && S_ISDIR(st.st_mode)) {
+                batchMode = 1;
+                break;
+            }
+        }
+    }
+
     /* Batch mode: expand directory arguments */
     if (batchMode) {
         int expandedCount = 0;
