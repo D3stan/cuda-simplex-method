@@ -126,7 +126,7 @@ void printBatchSummaryText(BatchResult* results, int count) {
            "------------------", "--------", "----------");
     
     for (int i = 0; i < count; i++) {
-        printf("%-20s %6d %6d  %-12s %18.6e %8d %10.4f\n",
+        printf("%-20s %6d %6d  %-12s %18.6f %8d %10.4f\n",
                results[i].filename, results[i].numVars, results[i].numConstraints,
                results[i].statusStr, results[i].objValue,
                results[i].iterations, results[i].elapsed);
