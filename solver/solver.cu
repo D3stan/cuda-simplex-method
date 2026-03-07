@@ -900,6 +900,29 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* pha
                     printf("[DIAG] Rows with negative RHS: %d / %d\n", negCount, tab->rows - 1);
                     printf("[DIAG] Objective row RHS: %.10e\n", tab->hostData[tab->cols - 1]);
                 }
+                // Final health snapshot at UNBOUNDED detection
+                if (config->healthLog) {
+                    syncTableauToHost(tab);
+                    int negRHS = 0;
+                    double maxAbsEntry = 0.0;
+                    double minReducedCost = 0.0;
+                    int rhsCol = tab->cols - 1;
+                    for (int r = 1; r < tab->rows; r++) {
+                        if (tab->hostData[r * tab->cols + rhsCol] < 0.0) negRHS++;
+                        for (int c = 0; c < rhsCol; c++) {
+                            double v = fabs(tab->hostData[r * tab->cols + c]);
+                            if (v > maxAbsEntry) maxAbsEntry = v;
+                        }
+                    }
+                    for (int c = 0; c < rhsCol; c++) {
+                        double v = tab->hostData[c];
+                        if (v < minReducedCost) minReducedCost = v;
+                    }
+                    double objRHS = tab->hostData[rhsCol];
+                    fprintf(config->healthLog, "%d,%d,%d,%.6e,%.6e,%.6e\n",
+                            run->totalIterations, run->phase, negRHS,
+                            maxAbsEntry, objRHS, minReducedCost);
+                }
                 status = UNBOUNDED;
                 break;
             }
@@ -950,6 +973,29 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* pha
             rederiveObjectiveRow(tab, phaseCosts, blockArt);
             if (config->verbose >= 2 && (iteration % (REFACTOR_INTERVAL * 10)) == 0)
                 printf("[DIAG] Re-derived objective row at iteration %d\n", iteration);
+
+            // Health snapshot: one row per refactorization interval
+            if (config->healthLog) {
+                int negRHS = 0;
+                double maxAbsEntry = 0.0;
+                double minReducedCost = 0.0;
+                int rhsCol = tab->cols - 1;
+                for (int r = 1; r < tab->rows; r++) {
+                    if (tab->hostData[r * tab->cols + rhsCol] < 0.0) negRHS++;
+                    for (int c = 0; c < rhsCol; c++) {
+                        double v = fabs(tab->hostData[r * tab->cols + c]);
+                        if (v > maxAbsEntry) maxAbsEntry = v;
+                    }
+                }
+                for (int c = 0; c < rhsCol; c++) {
+                    double v = tab->hostData[c];
+                    if (v < minReducedCost) minReducedCost = v;
+                }
+                double objRHS = tab->hostData[rhsCol];
+                fprintf(config->healthLog, "%d,%d,%d,%.6e,%.6e,%.6e\n",
+                        run->totalIterations, run->phase, negRHS,
+                        maxAbsEntry, objRHS, minReducedCost);
+            }
         }
         
         // Print tableau after this pivot

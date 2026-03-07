@@ -139,8 +139,7 @@ void printUsage(const char* progName) {
     fprintf(stderr, "  --json               Output solution in JSON format\n");
     fprintf(stderr, "  --csv                Output solution in CSV format\n");
     fprintf(stderr, "  --batch              Batch mode: solve multiple files, print summary\n");
-    fprintf(stderr, "  --log <file>         Write per-iteration log to CSV file\n");
-    fprintf(stderr, "  -h, --help           Show this help message\n\n");
+    fprintf(stderr, "  --log <file>         Write per-iteration log to CSV file\n");  fprintf(stderr, "  --health-log <file>  Write per-refactorization-interval health snapshot to CSV\n");    fprintf(stderr, "  -h, --help           Show this help message\n\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s problem.mps\n", progName);
     fprintf(stderr, "  %s problem.dat\n", progName);
@@ -191,10 +190,12 @@ static ParseResult parseAppArgs(int argc, char* argv[],
                                  SolverConfig* config,
                                  int* batchMode, int* interactiveFlag,
                                  const char** logFile,
+                                 const char** healthLogFile,
                                  const char** inputFiles, int* inputCount) {
     *batchMode       = 0;
     *interactiveFlag = 0;
     *logFile         = NULL;
+    *healthLogFile   = NULL;
     *inputCount      = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -238,6 +239,12 @@ static ParseResult parseAppArgs(int argc, char* argv[],
                 return PARSE_ERROR;
             }
             *logFile = argv[++i];
+        } else if (strcmp(argv[i], "--health-log") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --health-log requires a filename argument\n");
+                return PARSE_ERROR;
+            }
+            *healthLogFile = argv[++i];
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             return PARSE_HELP;
         } else if (argv[i][0] != '-') {
@@ -447,18 +454,20 @@ static int runSingleFileMode(const char** inputFiles, int inputCount,
 }
 
 int runApp(int argc, char* argv[]) {
-    SolverConfig config = {1, OUTPUT_TEXT, NULL, 0, 50000, 0.0};
+    SolverConfig config = {1, OUTPUT_TEXT, NULL, NULL, 0, 50000, 0.0};
     RunContext run = {0, 0, 0.0};
 
     int         batchMode      = 0;
     int         interactiveFlag = 0;
     const char* logFile        = NULL;
+    const char* healthLogFile  = NULL;
     int         inputCount     = 0;
     const char** inputFiles    = (const char**)malloc(argc * sizeof(const char*));
     int*        expandedOwned  = NULL;
 
     ParseResult pr = parseAppArgs(argc, argv, &config,
                                   &batchMode, &interactiveFlag, &logFile,
+                                  &healthLogFile,
                                   inputFiles, &inputCount);
     if (pr == PARSE_HELP) {
         printUsage(argv[0]);
@@ -507,6 +516,18 @@ int runApp(int argc, char* argv[]) {
         fprintf(config.iterLog, "iter,phase,pivot_col,pivot_row,reduced_cost,ratio,obj_rhs\n");
     }
 
+    /* Open health log if requested */
+    if (healthLogFile) {
+        config.healthLog = fopen(healthLogFile, "w");
+        if (!config.healthLog) {
+            fprintf(stderr, "Error: Cannot open health log file %s\n", healthLogFile);
+            if (config.iterLog) fclose(config.iterLog);
+            freeInputFiles(inputFiles, expandedOwned, inputCount);
+            return EXIT_FAILURE;
+        }
+        fprintf(config.healthLog, "iter,phase,neg_rhs_count,max_abs_entry,obj_rhs,min_reduced_cost\n");
+    }
+
     if (config.verbose && config.outputFormat == OUTPUT_TEXT) {
         printf("CUDA Two-Phase Simplex Solver\n");
         printf("=============================\n\n");
@@ -518,6 +539,7 @@ int runApp(int argc, char* argv[]) {
     if (deviceCount == 0) {
         fprintf(stderr, "Error: No CUDA-capable device found!\n");
         if (config.iterLog) fclose(config.iterLog);
+        if (config.healthLog) fclose(config.healthLog);
         freeInputFiles(inputFiles, expandedOwned, inputCount);
         return EXIT_FAILURE;
     }
@@ -540,6 +562,7 @@ int runApp(int argc, char* argv[]) {
     }
 
     if (config.iterLog) fclose(config.iterLog);
+    if (config.healthLog) fclose(config.healthLog);
     freeInputFiles(inputFiles, expandedOwned, inputCount);
     return exitCode;
 }

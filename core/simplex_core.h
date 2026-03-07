@@ -96,6 +96,7 @@ typedef struct {
     int verbose;
     OutputFormat outputFormat;
     FILE* iterLog;
+    FILE* healthLog;
     int debug;
     int maxIter;
     double timeout;
