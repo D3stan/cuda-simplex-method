@@ -795,6 +795,7 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* pha
     
     SimplexStatus status = OPTIMAL;
     int iteration = 0;
+    int optimalityRecheckUsed = 0;
     
     // Configure kernel launch parameters
     dim3 blockDim2D(TILE_SIZE, TILE_SIZE);
@@ -836,6 +837,19 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* pha
         
         // Check for optimality
         if (h_pivotCol < 0) {
+            /* Guard against false OPTIMAL caused by drifted reduced costs:
+             * rebuild objective row once, then re-run pivot selection. */
+            if (phaseCosts != NULL && !optimalityRecheckUsed) {
+                syncTableauToHost(tab);
+                if (rfc != NULL) {
+                    refactorConstraintColumns(tab, rfc, config->verbose);
+                }
+                rederiveObjectiveRow(tab, phaseCosts, blockArt);
+                optimalityRecheckUsed = 1;
+                if (config->verbose >= 2)
+                    printf("[DIAG] Rechecked objective row before OPTIMAL at iteration %d\n", iteration);
+                continue;
+            }
             if (config->verbose == 1)
                 printf("Iteration %d: Optimal solution found (min reduced cost: %.6f)\n", 
                        iteration, h_minVal);
@@ -845,6 +859,7 @@ SimplexStatus runSimplexPhase(Tableau* tab, int maxIterations, const double* pha
             status = OPTIMAL;
             break;
         }
+        optimalityRecheckUsed = 0;
         
         // Step 2: Find pivot row (leaving variable)
         h_pivotRow = -1;
@@ -1080,7 +1095,8 @@ static SimplexStatus runPhaseOne(Tableau* tab, LPProblem* lp,
     /* Feasibility check: Phase 1 objective must be (near) zero */
     syncTableauToHost(tab);
     double phase1Obj = tab->hostData[tab->cols - 1];
-    double phase1Tol = (double)(tab->rows) * (double)(tab->rows) * PERTURB_EPS + 1e-6;
+    double phase1Tol = PHASE1_OBJ_ABS_TOL_BASE +
+                       PHASE1_OBJ_ABS_TOL_PER_ART * (double)tab->numArtificial;
 
     if (config->verbose)
         printf("Phase 1 objective value: %.10f (tolerance: %.6e)\n", phase1Obj, phase1Tol);

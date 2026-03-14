@@ -17,11 +17,13 @@ double hpc_gettime(void);
 #define HARRIS_TOL 1e-5
 #define PERTURB_EPS 1e-4
 #define REFACTOR_INTERVAL 50
+#define PHASE1_OBJ_ABS_TOL_BASE 1e-6
+#define PHASE1_OBJ_ABS_TOL_PER_ART 1e-4
 /* Full constraint-column refactorization interval (Phase 2 only).
  * Recomputes B^{-1} from scratch every this-many iterations to prevent
  * numerical drift in the constraint rows from accumulating and causing
  * false UNBOUNDED declarations on large/degenerate problems. */
-#define REFACTOR_COL_INTERVAL 500
+#define REFACTOR_COL_INTERVAL 50
 /* PHASE2_PERTURB_EPS intentionally unused — kept for reference. */
 #define PHASE2_PERTURB_EPS 1e-4
 #define BLOCK_SIZE 256
