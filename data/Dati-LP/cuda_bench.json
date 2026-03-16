@@ -1,0 +1,122 @@
+{
+  "benchmark": "cuda_only_datilp",
+  "binary": "/home/local/STUDENTI/alessandro.porcheddu/cuda-simplex-method/simplex.out",
+  "data_dir": "/home/local/STUDENTI/alessandro.porcheddu/cuda-simplex-method/data/Dati-LP",
+  "warmup_runs": 1,
+  "timed_runs": 7,
+  "datasets": [
+    {
+      "dataset": "afiro.dat",
+      "status": "OPTIMAL",
+      "objective": -467.657143,
+      "timing": {
+        "mean_s": 0.002517285714285714,
+        "median_s": 0.002354,
+        "min_s": 0.002333,
+        "max_s": 0.002931,
+        "stdev_s": 0.00025264976699356916
+      }
+    },
+    {
+      "dataset": "blend.dat",
+      "status": "OPTIMAL",
+      "objective": -27.295968,
+      "timing": {
+        "mean_s": 0.010035428571428572,
+        "median_s": 0.009684,
+        "min_s": 0.009461,
+        "max_s": 0.011658,
+        "stdev_s": 0.0007765966042381884
+      }
+    },
+    {
+      "dataset": "lp11.dat",
+      "status": "OPTIMAL",
+      "objective": 1447.31926,
+      "timing": {
+        "mean_s": 6.695201142857143,
+        "median_s": 6.694211,
+        "min_s": 6.687251,
+        "max_s": 6.70296,
+        "stdev_s": 0.004814526540535876
+      }
+    },
+    {
+      "dataset": "lp20.dat",
+      "status": "OPTIMAL",
+      "objective": -9369.546835,
+      "timing": {
+        "mean_s": 0.00615,
+        "median_s": 0.00618,
+        "min_s": 0.006025,
+        "max_s": 0.0062,
+        "stdev_s": 6.353476738500475e-05
+      }
+    },
+    {
+      "dataset": "lp21.dat",
+      "status": "UNBOUNDED",
+      "objective": null,
+      "timing": {
+        "mean_s": 0.6506555714285714,
+        "median_s": 0.650062,
+        "min_s": 0.648879,
+        "max_s": 0.655979,
+        "stdev_s": 0.0024274890220927626
+      }
+    },
+    {
+      "dataset": "lp22.dat",
+      "status": "OPTIMAL",
+      "objective": -23.43873,
+      "timing": {
+        "mean_s": 0.07884985714285714,
+        "median_s": 0.0783,
+        "min_s": 0.077448,
+        "max_s": 0.081068,
+        "stdev_s": 0.0014767884556892833
+      }
+    },
+    {
+      "dataset": "lp23.dat",
+      "status": "OPTIMAL",
+      "objective": 177.447551,
+      "timing": {
+        "mean_s": 0.07728242857142857,
+        "median_s": 0.077317,
+        "min_s": 0.07681,
+        "max_s": 0.077719,
+        "stdev_s": 0.0003054263998319158
+      }
+    },
+    {
+      "dataset": "lp5.dat",
+      "status": "OPTIMAL",
+      "objective": 184.027526,
+      "timing": {
+        "mean_s": 0.11144357142857143,
+        "median_s": 0.110179,
+        "min_s": 0.108958,
+        "max_s": 0.115494,
+        "stdev_s": 0.002753061499321732
+      }
+    },
+    {
+      "dataset": "lp6.dat",
+      "status": "OPTIMAL",
+      "objective": 130.196528,
+      "timing": {
+        "mean_s": 0.10316985714285715,
+        "median_s": 0.10253,
+        "min_s": 0.101835,
+        "max_s": 0.107178,
+        "stdev_s": 0.001870974561431503
+      }
+    }
+  ],
+  "summary": {
+    "dataset_count": 9,
+    "optimal_count": 8,
+    "total_mean_time_s": 7.735305142857143
+  }
+}
