@@ -23,7 +23,7 @@ except ImportError:
 
 # ── Configurazione ───────────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_TESTS_DIR = os.path.join(SCRIPT_DIR, "data", "Dati-LP")
+DEFAULT_TESTS_DIR = os.path.join(SCRIPT_DIR, "data", "netlib")
 CUDA_BINARY = os.path.join(SCRIPT_DIR, "simplex.out")
 
 WARMUP_RUNS = 2       # iterazioni di riscaldamento (scartate)
@@ -168,14 +168,14 @@ def main():
     dat_files = []
     for t in targets:
         if os.path.isdir(t):
-            dat_files.extend(glob.glob(os.path.join(t, "*.dat")))
-        elif os.path.isfile(t) and t.endswith(".dat"):
+            dat_files.extend(glob.glob(os.path.join(t, "*.mps")))
+        elif os.path.isfile(t) and t.endswith(".mps"):
             dat_files.append(t)
         else:
-            print(f"AVVISO: salto {t} (non e' una directory o file .dat)")
+            print(f"AVVISO: salto {t} (non e' una directory o file .mps)")
     dat_files = sorted(dat_files)
     if not dat_files:
-        print(f"Nessun file .dat trovato in: {targets}")
+        print(f"Nessun file .mps trovato in: {targets}")
         sys.exit(1)
 
     print("=" * 90)
