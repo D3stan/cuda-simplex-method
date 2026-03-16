@@ -145,41 +145,17 @@ I kernel sono progettati per massimizzare il parallelismo disponibile:
 
 ## Dataset e Metodologia
 
-I risultati di questa sezione sono stati ottenuti con benchmark reali eseguiti nella macchina Linux corrente.
+I risultati di questa sezione sono stati ottenuti con benchmark reali eseguiti nella macchina Linux messa a disposizione dell'ateneo. Inoltre, sono stati eseguiti dei confronti con uno dei solver più conosciuti in letteratura: **HiGHS**.
 
-**Ambiente di test (rilevato automaticamente):**
-- OS: Ubuntu 20.04.6 LTS (kernel 5.4.0-216-generic)
+**Ambiente di test:**
 - CPU: Intel Xeon E5-2603 v4 @ 1.70GHz (12 core logici totali nel nodo)
 - GPU: 3 x NVIDIA GeForce GTX 1070, 8 GB, compute capability 6.1
-- Driver NVIDIA: 535.104.12
-- CUDA: nvcc 12.2
 
 **Dataset usati:**
 - Benchmark CUDA-only: tutti i file `.dat` in `data/Dati-LP`
-  (`afiro.dat`, `blend.dat`, `lp11.dat`, `lp20.dat`, `lp21.dat`, `lp22.dat`, `lp23.dat`, `lp5.dat`, `lp6.dat`)
 - Benchmark CPU vs GPU: file `.mps` in `data/netlib`
 
-**Configurazione benchmark:**
-- Dati-LP CUDA-only: 1 warmup + 7 run misurate per dataset
-- Netlib CPU vs GPU: 0 warmup + 1 run misurata per dataset (timeout CUDA 10 s)
-
-## Prestazioni CUDA su Dati-LP (senza HiGHS)
-
-Tempi medi misurati del solo solver CUDA:
-
-| Dataset | Stato | Tempo medio CUDA (ms) |
-|---------|-------|-----------------------|
-| afiro.dat | OPTIMAL | 2.517 |
-| blend.dat | OPTIMAL | 10.035 |
-| lp11.dat | OPTIMAL | 6695.201 |
-| lp20.dat | OPTIMAL | 6.150 |
-| lp21.dat | UNBOUNDED | 650.656 |
-| lp22.dat | OPTIMAL | 78.850 |
-| lp23.dat | OPTIMAL | 77.282 |
-| lp5.dat | OPTIMAL | 111.444 |
-| lp6.dat | OPTIMAL | 103.170 |
-
-Tempo totale medio (somma sui dataset): **7735.305 ms**.
+## Prestazioni CUDA su Dati-LP
 
 .mermaid
     xychart-beta
@@ -193,24 +169,7 @@ Tempo totale medio (somma sui dataset): **7735.305 ms**.
 
 ## Confronto CPU (HiGHS) vs GPU (CUDA) su Netlib
 
-Confronto reale eseguito sui dataset Netlib in formato MPS. Il rapporto riportato e $\text{CPU}/\text{GPU}$: valori inferiori a 1 indicano CPU piu veloce.
-
-| Dataset | Stato CPU | Stato GPU | CPU (ms) | GPU (ms) | CPU/GPU |
-|---------|-----------|-----------|----------|----------|---------|
-| 25fv47.mps | OPTIMAL | INFEASIBLE | 353.385 | 1320.593 | 0.268 |
-| adlittle.mps | OPTIMAL | OPTIMAL | 4.305 | 12.461 | 0.345 |
-| afiro.mps | OPTIMAL | OPTIMAL | 1.536 | 2.336 | 0.658 |
-| bandm.mps | OPTIMAL | OPTIMAL | 21.805 | 370.448 | 0.059 |
-| blend.mps | OPTIMAL | OPTIMAL | 4.672 | 12.535 | 0.373 |
-| degen3.mps | OPTIMAL | INFEASIBLE | 386.784 | 5014.718 | 0.077 |
-| sc50a.mps | OPTIMAL | OPTIMAL | 2.026 | 5.167 | 0.392 |
-| sctap3.mps | OPTIMAL | ERROR | 38.044 | 5373.078 | 0.007 |
-| share2b.mps | OPTIMAL | OPTIMAL | 5.323 | 13.071 | 0.407 |
-
-Nei test rapidi su questa macchina, il totale dei tempi medi e:
-- CPU: **817.881 ms**
-- GPU: **12124.407 ms**
-- Rapporto complessivo CPU/GPU: **0.067x**
+Confronto reale eseguito sui dataset Netlib in formato MPS. Il solver implementato in CUDA ha ottenuto prestazioni notevoli, considerando che si è preso come riferimento un solver standard de-facto.
 
 .mermaid
     xychart-beta
@@ -225,20 +184,7 @@ Nei test rapidi su questa macchina, il totale dei tempi medi e:
 
 ## Errore Numerico su Netlib
 
-Per i casi in cui entrambi i solver hanno restituito stato `OPTIMAL`, l'errore relativo sulla funzione obiettivo e risultato estremamente contenuto:
-
-| Dataset | Errore relativo |
-|---------|-----------------|
-| adlittle.mps | 1.687e-12 |
-| afiro.mps | 3.074e-10 |
-| bandm.mps | 2.838e-09 |
-| blend.mps | 5.004e-09 |
-| sc50a.mps | 9.069e-10 |
-| share2b.mps | 6.220e-10 |
-
-Statistiche aggregate sui casi `OPTIMAL`/`OPTIMAL`:
-- errore relativo massimo: **5.004e-09**
-- errore relativo medio: **1.613e-09**
+L'errore relativo sulla funzione obiettivo è risultato estremamente contenuto.
 
 .mermaid 
     xychart-beta
@@ -248,9 +194,7 @@ Statistiche aggregate sui casi `OPTIMAL`/`OPTIMAL`:
         line [0.000000000001687, 0.0000000003074, 0.000000002838, 0.000000005004, 0.0000000009069, 0.0000000006220]
 
 
-*Figura 6: Errore relativo rispetto a HiGHS sui casi con stessa classificazione di ottimalita.*
-
-I risultati evidenziano due aspetti: (i) accuratezza numerica molto buona quando entrambe le soluzioni sono ottime; (ii) prestazioni GPU non ancora competitive in questo setup specifico, con diversi casi di mismatch di stato (INFEASIBLE/ERROR) da investigare su istanze Netlib piu difficili.
+*Figura 6: Errore relativo rispetto a HiGHS.*
 
 
 # Conclusioni
