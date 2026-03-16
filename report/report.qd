@@ -34,10 +34,11 @@ Quando non è immediatamente disponibile una BFS iniziale, si ricorre al metodo 
 
 .mermaid 
     flowchart TD
-        Start([Inizio]) --> Init[Costruzione tableau<br/>con variabili artificiali]
-        Init --> Phase1{Fase 1?}
-        Phase1 -->|Sì| P1[Minimizza Σ variabili artificiali]
-        P1 --> Check1{w = 0?}
+        Start([Simplesso forma standard]) --> Init[Costruzione tableau<br/>con variabili artificiali]
+        Init --> Phase1{RHS negativi?}
+        Phase1 -->|Sì| P1[Fase 1]
+        P1 --> Min[Minimizzo somma variabili artificiali]
+        Min --> Check1{variabili artificiali<br/> in base?}
         Check1 -->|No| Infeasible[Problema inammissibile]
         Check1 -->|Sì| RemoveR[Elimina righe artificiali]
         Phase1 -->|No| RemoveR
@@ -185,6 +186,8 @@ In sintesi, il confronto non indica ancora un vantaggio prestazionale assoluto d
 
 
 *Figura 5: Barre = HiGHS, linea = CUDA.*
+
+<<<
 
 ## Errore Numerico su Netlib
 
