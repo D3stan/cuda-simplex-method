@@ -1,0 +1,16 @@
+.include {settings.qd} 
+
+.whitespace height:{5%} 
+
+.center 
+    #! Implementazione dell'algoritmo del Simplesso attraverso programmazione parallela con CUDA
+
+.whitespace height:{50%} 
+
+.align {end} 
+    **Studente**
+.align {end} 
+    Alessandro Porcheddu
+
+.tableofcontents
+
