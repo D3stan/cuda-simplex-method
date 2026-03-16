@@ -5,7 +5,7 @@
 .center 
     #! Implementazione dell'algoritmo del Simplesso attraverso programmazione parallela con CUDA
 
-.whitespace height:{40%} 
+.whitespace height:{30%} 
 
 .align {end} 
     **Corso**

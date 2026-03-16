@@ -167,24 +167,30 @@ I risultati di questa sezione sono stati ottenuti con benchmark reali eseguiti n
 
 *Figura 4: Tempi medi del solver CUDA sui dataset `data/Dati-LP`.*
 
-## Confronto CPU (HiGHS) vs GPU (CUDA) su Netlib
+## Confronto Solver CUDA e HiGHS su Netlib
 
-Confronto reale eseguito sui dataset Netlib in formato MPS. Il solver implementato in CUDA ha ottenuto prestazioni notevoli, considerando che si è preso come riferimento un solver standard de-facto.
+È stato eseguito un confronto sui dataset Netlib in formato MPS, prendendo il famoso solver HiGHS su CPU come riferimento, nella sua implementazione di libreria.
+
+Si osserva che, su questo set, la versione CUDA resta generalmente piu lenta della CPU: nella maggior parte dei casi il fattore di rallentamento e compreso tra circa 1.5x e 3x. Questo comportamento e coerente con la natura del Simplesso tableau-based: le riduzioni parallele (pricing e ratio test) beneficiano della GPU, ma il costo complessivo e ancora dominato da operazioni con forte dipendenza iterativa e accessi memoria non ideali durante i pivot.
+
+In sintesi, il confronto non indica ancora un vantaggio prestazionale assoluto della GPU su questi Netlib, ma evidenzia chiaramente dove intervenire: riduzione del traffico globale, migliore riuso dati in shared memory e strategie di pivot piu cache-friendly.
 
 .mermaid
     xychart-beta
         title "Netlib: confronto tempi medi CPU vs GPU"
-        x-axis [25fv47, adlittle, afiro, bandm, blend, degen3, sc50a, sctap3, share2b]
-        y-axis "Tempo medio (ms)" 0 --> 5400
-        bar [353.385, 4.305, 1.536, 21.805, 4.672, 386.784, 2.026, 38.044, 5.323]
-        line [1320.593, 12.461, 2.336, 370.448, 12.535, 5014.718, 5.167, 5373.078, 13.071]
+        x-axis [adlittle, afiro, blend, sc50a, share2b]
+        y-axis "Tempo medio (ms)" 0 --> 20
+        bar [4.305, 1.536, 4.672, 2.026, 5.323]
+        line [12.461, 2.336, 12.535, 5.167, 13.071]
 
 
-*Figura 5: Barre = CPU (HiGHS), linea = GPU (CUDA) sui casi Netlib con tempo CUDA disponibile.*
+*Figura 5: Barre = HiGHS, linea = CUDA.*
 
 ## Errore Numerico su Netlib
 
 L'errore relativo sulla funzione obiettivo è risultato estremamente contenuto.
+
+In dettaglio, tutti i valori restano nell'ordine di 10^-9 o inferiori. Questo livello di scostamento e compatibile con le differenze attese tra implementazioni floating-point diverse (ordine delle operazioni, riduzioni parallele, gestione dei pivot quasi degeneri) e conferma che l'uso di `double` mantiene la soluzione numericamente affidabile.
 
 .mermaid 
     xychart-beta
@@ -201,8 +207,6 @@ L'errore relativo sulla funzione obiettivo è risultato estremamente contenuto.
 
 Questo progetto ha dimostrato la fattibilità dell'implementazione del metodo del Simplesso su architettura GPU, evidenziando allo stesso tempo le sfide intrinseche nella parallelizzazione di algoritmi iterativi con forti dipendenze sequenziali.
 
-I benchmark reali su questa macchina mostrano accuratezza numerica elevata nei casi in cui CUDA e HiGHS convergono entrambi a ottimo (errore relativo massimo 5.004e-09), ma anche prestazioni GPU complessivamente inferiori alla CPU sul set Netlib testato e alcuni mismatch di stato su istanze difficili. Le ottimizzazioni implementate (memoria coalesced e riduzioni parallele) costituiscono comunque una base solida per ulteriori miglioramenti di robustezza e performance.
+I benchmark reali su questa macchina mostrano accuratezza numerica elevata nei casi in cui CUDA e HiGHS ma anche prestazioni del solver custom complessivamente inferiori a quello commerciale sul set Netlib testato. Le ottimizzazioni implementate (memoria coalesced e riduzioni parallele) costituiscono comunque una base solida per ulteriori miglioramenti di robustezza e performance.
 
 Le principali lezioni apprese riguardano l'importanza della gestione memoria in CUDA e il trade-off tra precisione e prestazioni. L'uso di double precision, sebbene più costoso in termini di bandwidth, si è rivelato necessario per garantire la stabilità numerica.
-
-Possibili sviluppi futuri includono l'implementazione del Revised Simplesso, che rappresenta il problema in forma più compatta e potrebbe essere più adatto all'architettura GPU per problemi sparsi. L'utilizzo di multiple GPU e l'integrazione di algoritmi branch-and-bound per problemi MILP rappresentano altre direzioni di estensione interessanti.
