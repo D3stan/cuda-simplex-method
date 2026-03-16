@@ -5,7 +5,17 @@
 .center 
     #! Implementazione dell'algoritmo del Simplesso attraverso programmazione parallela con CUDA
 
-.whitespace height:{50%} 
+.whitespace height:{40%} 
+
+.align {end} 
+    **Corso**
+.align {end} 
+    Ricerca Operativa
+
+.align {end} 
+    **Anno Accademico**
+.align {end} 
+    2025/2026
 
 .align {end} 
     **Studente**
