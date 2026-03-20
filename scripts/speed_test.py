@@ -23,8 +23,8 @@ except ImportError:
 
 # ── Configurazione ───────────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_TESTS_DIR = os.path.join(SCRIPT_DIR, "data", "netlib")
-CUDA_BINARY = os.path.join(SCRIPT_DIR, "simplex.out")
+DEFAULT_TESTS_DIR = os.path.join(SCRIPT_DIR, "..", "data", "netlib")
+CUDA_BINARY = os.path.join(SCRIPT_DIR, "..", "simplex.out")
 
 WARMUP_RUNS = 2       # iterazioni di riscaldamento (scartate)
 TIMED_RUNS = 10       # iterazioni misurate per problema
