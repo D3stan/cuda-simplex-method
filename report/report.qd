@@ -34,22 +34,22 @@ Quando non è immediatamente disponibile una BFS iniziale, si ricorre al metodo 
 
 .mermaid 
     flowchart TD
-        Start([Inizio]) --> Init[Costruzione tableau<br/>con variabili artificiali]
-        Init --> Phase1{Fase 1?}
-        Phase1 -->|Sì| P1[Minimizza Σ variabili artificiali]
-        P1 --> Check1{w = 0?}
-        Check1 -->|No| Infeasible[Problema inammissibile]
-        Check1 -->|Sì| RemoveR[Elimina righe artificiali]
-        Phase1 -->|No| RemoveR
-        RemoveR --> Phase2[Fase 2: Ottimizza obiettivo]
-        Phase2 --> Pricing[Pricing: trova colonna pivot<br/>min costo ridotto]
-        Pricing --> OptCheck{Costi ridotti ≥ 0?}
+        Start([Simplesso forma standard]) --> Init[Costruzione tableau<br/>con variabili artificiali]
+        Init --> Phase1{RHS negativi?}
+        Phase1 -->|Sì| P1[Fase 1: aggiungi variabili artificiali ]
+        P1 --> Min[minimizza somma variabili artificiali]
+        Min --> Check1{variabili artificiali<br/> in base?}
+        Check1 -->|Si| Infeasible[Problema inammissibile]
+        Check1 -->|No| RemoveR[Fase 2: rimuovi variabili artificiali]
+        RemoveR --> Phase2[Ottimizza obiettivo]
+        Phase2 --> OptCheck{Costi ridotti ≤ 0?}
+        Phase1 -->|No| OptCheck
         OptCheck -->|Sì| Optimal([Soluzione ottima])
         OptCheck -->|No| RatioTest[Rapporti minimi: trova riga pivot]
         RatioTest --> UnboundCheck{y ≤ 0?}
         UnboundCheck -->|Sì| Unbounded([Problema illimitato])
         UnboundCheck -->|No| Pivot[Operazione di pivot<br/>aggiorna tableau]
-        Pivot --> Pricing
+        Pivot --> OptCheck
 
 *Figura 1: Diagramma di flusso dell'algoritmo Simplesso con metodo delle due fasi.*
 
@@ -185,6 +185,8 @@ In sintesi, il confronto non indica ancora un vantaggio prestazionale assoluto d
 
 
 *Figura 5: Barre = HiGHS, linea = CUDA.*
+
+<<<
 
 ## Errore Numerico su Netlib
 
