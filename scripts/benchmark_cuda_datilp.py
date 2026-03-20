@@ -60,7 +60,7 @@ def main() -> int:
     parser.add_argument("--binary", default="simplex.out", help="Path to CUDA solver binary")
     parser.add_argument("--data-dir", default="data/Dati-LP", help="Directory with .dat files")
     parser.add_argument("--warmup", type=int, default=1, help="Warm-up runs per dataset")
-    parser.add_argument("--runs", type=int, default=7, help="Timed runs per dataset")
+    parser.add_argument("--runs", type=int, default=3, help="Timed runs per dataset")
     parser.add_argument("--timeout", type=int, default=600, help="Timeout (seconds) for one solver run")
     parser.add_argument("--json-out", default="", help="Optional output JSON file")
     parser.add_argument("--csv-out", default="", help="Optional output CSV file")

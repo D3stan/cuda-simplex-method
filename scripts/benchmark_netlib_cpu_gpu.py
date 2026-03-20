@@ -116,7 +116,7 @@ def main() -> int:
     parser.add_argument("--binary", default="simplex.out", help="Path to CUDA solver binary")
     parser.add_argument("--netlib-dir", default="data/netlib", help="Directory with .mps files")
     parser.add_argument("--warmup", type=int, default=1, help="Warm-up runs per solver per dataset")
-    parser.add_argument("--runs", type=int, default=5, help="Timed runs per solver per dataset")
+    parser.add_argument("--runs", type=int, default=2, help="Timed runs per solver per dataset")
     parser.add_argument("--timeout", type=int, default=600, help="Timeout (seconds) for one CUDA run")
     parser.add_argument("--json-out", default="", help="Optional output JSON file")
     parser.add_argument("--csv-out", default="", help="Optional output CSV file")
